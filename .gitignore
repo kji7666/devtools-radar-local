@@ -1,0 +1,46 @@
+# Browser debug profiles / sessions
+edge_debug_profile/
+edge_profile/
+chrome_profile/
+browser_profile/
+auth_state.json
+
+# Runtime data
+logs/
+outputs/
+runs/
+screenshots/
+output.txt
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node / Electron
+app/node_modules/
+app/dist/
+app/dist-electron/
+app/release/
+app/.vite/
+
+# Personal task data
+tasks/
+tasks_meta/
+
+# Lock / temp
+.runner.lock
+*.tmp
+*.bak
+
+# Local config / secrets
+.env
+.env.*
+config.local.yaml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

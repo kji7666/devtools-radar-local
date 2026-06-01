@@ -1,0 +1,67 @@
+chatgpt_url: "https://chatgpt.com/"
+
+input_file: "input.txt"
+output_file: "output.txt"
+
+batch_mode: true
+tasks_dir: "tasks"
+outputs_dir: "outputs"
+archive_dir: "archive"
+failed_dir: "failed"
+screenshots_dir: "screenshots"
+logs_dir: "logs"
+
+task_file_pattern: "*.txt"
+max_tasks_per_run: 10
+archive_processed_tasks: true
+
+# 重點：false = 沿用同一個對話上下文
+new_chat_per_task: false
+
+cdp_url: "http://127.0.0.1:9222"
+auto_start_edge: true
+edge_path: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+edge_profile_dir: "D:\\side_project\\auto_gpt\\edge_debug_profile"
+
+browser_width: 1280
+browser_height: 900
+
+page_ready_timeout_seconds: 90
+timeout_seconds: 300
+stable_check_interval_seconds: 3
+stable_rounds_required: 4
+
+auto_refresh_if_not_ready: true
+max_refresh_attempts: 2
+
+retry_per_task: 1
+retry_delay_seconds: 5
+
+close_browser_after_done: false
+
+selectors:
+  composer_candidates:
+    - '#prompt-textarea'
+    - 'div#prompt-textarea'
+    - 'div[contenteditable="true"]'
+    - '[contenteditable="true"]'
+    - 'textarea'
+
+  assistant_message: '[data-message-author-role="assistant"]'
+
+  send_button_candidates:
+    - 'button[data-testid="send-button"]'
+    - 'button[aria-label="Send prompt"]'
+    - 'button[aria-label*="Send"]'
+    - 'button[aria-label*="送出"]'
+    - 'button[aria-label*="提交"]'
+
+  stop_button_candidates:
+    - 'button[aria-label*="Stop"]'
+    - 'button[aria-label*="停止"]'
+    - 'button[data-testid="stop-button"]'
+
+  new_chat_candidates:
+    - 'a[href="/"]'
+    - 'button[aria-label*="New chat"]'
+    - 'button[aria-label*="新對話"]'
