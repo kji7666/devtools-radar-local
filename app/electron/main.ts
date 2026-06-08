@@ -19,6 +19,7 @@ const SCREENSHOTS_DIR = path.join(PROJECT_ROOT, 'screenshots')
 const CONFIG_PATH = path.join(PROJECT_ROOT, 'config.yaml')
 const OUTPUT_PATH = path.join(PROJECT_ROOT, 'output.txt')
 const LOCK_PATH = path.join(PROJECT_ROOT, '.runner.lock')
+const API_BASE_URL = 'http://127.0.0.1:8788'
 
 type RunResult = {
   code: number
@@ -569,4 +570,86 @@ ipcMain.handle('shell:openOutputsFolder', async () => {
 ipcMain.handle('shell:openRunsFolder', async () => {
   await shell.openPath(RUNS_DIR)
   return true
+})
+
+async function apiJson(pathname: string, options: RequestInit = {}) {
+  const url = `${API_BASE_URL}${pathname}`
+
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...(options.headers || {})
+    }
+  })
+
+  const text = await response.text()
+
+  let data: any = null
+
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = { raw: text }
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      data?.detail ||
+      data?.error?.message ||
+      data?.message ||
+      `API request failed: ${response.status} ${response.statusText}`
+    )
+  }
+
+  return data
+}
+
+ipcMain.handle('api:health', async () => {
+  return await apiJson('/health')
+})
+
+ipcMain.handle('mcp:security', async () => {
+  return await apiJson('/v1/mcp/security')
+})
+
+ipcMain.handle('mcp:audit', async (_event, limit: number = 50) => {
+  return await apiJson(`/v1/mcp/audit?limit=${encodeURIComponent(String(limit))}`)
+})
+
+ipcMain.handle('mcp:approvals:list', async () => {
+  return await apiJson('/v1/mcp/approvals')
+})
+
+ipcMain.handle('mcp:approvals:approve', async (_event, pendingId: string) => {
+  return await apiJson(`/v1/mcp/approvals/${encodeURIComponent(pendingId)}/approve`, {
+    method: 'POST'
+  })
+})
+
+ipcMain.handle('mcp:approvals:deny', async (_event, pendingId: string) => {
+  return await apiJson(`/v1/mcp/approvals/${encodeURIComponent(pendingId)}/deny`, {
+    method: 'POST'
+  })
+})
+
+ipcMain.handle('mcp:config:get', async () => {
+  return await apiJson('/v1/mcp/config')
+})
+
+ipcMain.handle('mcp:config:save', async (_event, config: any) => {
+  return await apiJson('/v1/mcp/config', {
+    method: 'PUT',
+    body: JSON.stringify({ config })
+  })
+})
+
+ipcMain.handle('mcp:servers:list', async () => {
+  return await apiJson('/v1/mcp/servers')
+})
+
+ipcMain.handle('mcp:servers:reload', async () => {
+  return await apiJson('/v1/mcp/reload', {
+    method: 'POST'
+  })
 })

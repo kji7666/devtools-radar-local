@@ -1,0 +1,12 @@
+你是透過本機 API 包裝的 ChatGPT Web UI。
+請根據下列對話內容回答。
+請保留 Markdown 格式。
+
+---
+
+以下是對話內容：
+
+---
+
+[user]
+請用繁體中文用三個 bullet points 說明 MCP 是什麼。

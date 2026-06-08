@@ -38,5 +38,16 @@ contextBridge.exposeInMainWorld('autoGpt', {
 
   openProjectFolder: () => ipcRenderer.invoke('shell:openProjectFolder'),
   openOutputsFolder: () => ipcRenderer.invoke('shell:openOutputsFolder'),
-  openRunsFolder: () => ipcRenderer.invoke('shell:openRunsFolder')
+  openRunsFolder: () => ipcRenderer.invoke('shell:openRunsFolder'),
+  apiHealth: () => ipcRenderer.invoke('api:health'),
+
+  getMcpSecurity: () => ipcRenderer.invoke('mcp:security'),
+  getMcpAudit: (limit?: number) => ipcRenderer.invoke('mcp:audit', limit),
+  listMcpApprovals: () => ipcRenderer.invoke('mcp:approvals:list'),
+  approveMcpCall: (pendingId: string) => ipcRenderer.invoke('mcp:approvals:approve', pendingId),
+  denyMcpCall: (pendingId: string) => ipcRenderer.invoke('mcp:approvals:deny', pendingId),
+  getMcpConfig: () => ipcRenderer.invoke('mcp:config:get'),
+  saveMcpConfig: (config: any) => ipcRenderer.invoke('mcp:config:save', config),
+  listMcpServers: () => ipcRenderer.invoke('mcp:servers:list'),
+  reloadMcpServers: () => ipcRenderer.invoke('mcp:servers:reload'),
 })

@@ -1,42 +1,70 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import type { FileItem, RunRecord, RunResult, SystemStatus, TaskMeta } from './types'
+import type {
+  FileItem,
+  RunRecord,
+  RunResult,
+  SystemStatus,
+  TaskMeta,
+  McpApproval,
+  McpAuditRecord
+} from './types'
 
-type Page = 'dashboard' | 'chat' | 'tasks' | 'outputs' | 'runs' | 'logs' | 'settings'
+type Page = 'dashboard' | 'chat' | 'tasks' | 'outputs' | 'runs' | 'mcp' | 'logs' | 'settings'
 
 const page = ref<Page>('dashboard')
-const busy = ref(false)
-const status = ref<SystemStatus | null>(null)
-
-const chatInput = ref('')
-const chatMessages = ref<{ role: 'user' | 'assistant' | 'system' | 'error'; text: string }[]>([])
-const lastRun = ref<RunResult | null>(null)
-
-const tasksMeta = ref<TaskMeta[]>([])
-const selectedTask = ref<TaskMeta | null>(null)
-
-const outputs = ref<FileItem[]>([])
-const selectedOutputName = ref('')
-const selectedOutputContent = ref('')
-
-const runs = ref<RunRecord[]>([])
-const selectedRun = ref<RunRecord | null>(null)
-
-const selectedLog = ref<'runner.log' | 'bat.log'>('runner.log')
-const logContent = ref('')
-
-const configContent = ref('')
 const toast = ref('')
+const busy = ref(false)
 
-const weekDays = [
-  { label: '一', value: 'MON' },
-  { label: '二', value: 'TUE' },
-  { label: '三', value: 'WED' },
-  { label: '四', value: 'THU' },
-  { label: '五', value: 'FRI' },
-  { label: '六', value: 'SAT' },
-  { label: '日', value: 'SUN' }
-]
+const status = ref<SystemStatus | null>(null)
+const configText = ref('')
+
+const chatPrompt = ref('')
+const chatResult = ref('')
+const chatBusy = ref(false)
+
+const taskList = ref<TaskMeta[]>([])
+const selectedTask = ref<TaskMeta | null>(null)
+const taskBusy = ref(false)
+
+const outputList = ref<FileItem[]>([])
+const selectedOutput = ref<FileItem | null>(null)
+const outputContent = ref('')
+
+const runList = ref<RunRecord[]>([])
+const selectedRun = ref<RunRecord | null>(null)
+const runContent = ref('')
+
+const logsText = ref('')
+
+const mcpApprovals = ref<McpApproval[]>([])
+const mcpAudit = ref<McpAuditRecord[]>([])
+const mcpSecurity = ref<any>(null)
+const mcpHealth = ref<any>(null)
+const selectedMcpApproval = ref<McpApproval | null>(null)
+const mcpBusy = ref(false)
+
+const mcpConfigText = ref('')
+const mcpServers = ref<any[]>([])
+const mcpConfigBusy = ref(false)
+
+function bridge() {
+  if (!window.autoGpt) {
+    throw new Error('Electron bridge window.autoGpt is not available')
+  }
+
+  return window.autoGpt
+}
+
+function showToast(message: string) {
+  toast.value = message
+
+  window.setTimeout(() => {
+    if (toast.value === message) {
+      toast.value = ''
+    }
+  }, 2800)
+}
 
 const pageTitle = computed(() => {
   const map: Record<Page, string> = {
@@ -45,232 +73,211 @@ const pageTitle = computed(() => {
     tasks: 'Tasks',
     outputs: 'Outputs',
     runs: 'Runs',
+    mcp: 'MCP Approvals',
     logs: 'Logs',
     settings: 'Settings'
   }
+
   return map[page.value]
 })
 
-function bridge() {
-  if (!window.autoGpt) {
-    throw new Error('Electron bridge 未載入。請用 npm run dev 啟動 Electron，不要只用瀏覽器開 Vite。')
+const pendingApprovalCount = computed(() => {
+  return mcpApprovals.value.filter((item) => item.status === 'pending').length
+})
+
+function formatTime(value?: string) {
+  if (!value) return ''
+
+  try {
+    return new Date(value).toLocaleString()
+  } catch {
+    return value
   }
-  return window.autoGpt
 }
 
-function showToast(message: string) {
-  toast.value = message
-  setTimeout(() => {
-    if (toast.value === message) toast.value = ''
-  }, 3500)
+function formatJson(value: any) {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function shortText(text: string, max = 600) {
+  if (!text) return ''
+  if (text.length <= max) return text
+
+  return `${text.slice(0, max)}\n\n... truncated ${text.length - max} chars`
+}
+
+function statusClass(value: string) {
+  const s = String(value || '').toLowerCase()
+
+  if (s.includes('success') || s.includes('ok') || s.includes('approved_executed')) {
+    return 'ok'
+  }
+
+  if (s.includes('pending') || s.includes('timeout') || s.includes('confirm')) {
+    return 'warn'
+  }
+
+  if (s.includes('error') || s.includes('failed') || s.includes('denied') || s.includes('blocked')) {
+    return 'bad'
+  }
+
+  return ''
+}
+
+function newTaskTemplate(): TaskMeta {
+  const now = Date.now()
+
+  return {
+    id: `task_${now}`,
+    title: 'New Task',
+    prompt: '',
+    enabled: true,
+    conversationMode: 'same',
+    schedule: {
+      enabled: false,
+      type: 'manual',
+      date: '',
+      time: '09:00',
+      daysOfWeek: []
+    },
+    lastRunAt: '',
+    lastStatus: '',
+    lastRunFile: '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  } as TaskMeta
 }
 
 function toPlainTask(task: TaskMeta): TaskMeta {
   return JSON.parse(JSON.stringify(task))
 }
 
-function formatTime(iso: string) {
-  if (!iso) return '-'
-  try {
-    return new Date(iso).toLocaleString()
-  } catch {
-    return iso
-  }
-}
-
-function today() {
-  return new Date().toISOString().slice(0, 10)
-}
-
 async function refreshStatus() {
   try {
     status.value = await bridge().getStatus()
   } catch (error: any) {
-    console.error('refreshStatus failed:', error)
-    showToast(`狀態讀取失敗：${error?.message ?? error}`)
+    showToast(`Status 讀取失敗：${error?.message ?? error}`)
   }
 }
 
-async function sendPrompt() {
-  const prompt = chatInput.value.trim()
-  if (!prompt || busy.value) return
-
-  chatMessages.value.push({ role: 'user', text: prompt })
-  chatInput.value = ''
-  busy.value = true
-
+async function refreshConfig() {
   try {
-    const result = await bridge().runPrompt(prompt)
-    lastRun.value = result
-
-    chatMessages.value.push({
-      role: result.code === 0 ? 'assistant' : 'error',
-      text:
-        result.code === 0
-          ? result.outputText || '(output.txt 沒有內容)'
-          : result.stderr || result.stdout || result.outputText || '執行失敗'
-    })
-
-    await refreshOutputs()
-    await refreshRuns()
-    await refreshLogs()
+    configText.value = await bridge().readConfig()
   } catch (error: any) {
-    console.error('sendPrompt failed:', error)
-    chatMessages.value.push({
-      role: 'error',
-      text: `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-    })
-  } finally {
-    busy.value = false
-    await refreshStatus()
+    showToast(`Config 讀取失敗：${error?.message ?? error}`)
   }
 }
 
-async function runBatch() {
-  if (busy.value) return
-
-  busy.value = true
-  chatMessages.value.push({ role: 'system', text: '開始執行 tasks/ 批次任務...' })
-
+async function saveConfig() {
   try {
-    const result = await bridge().runBatch()
-    lastRun.value = result
-    chatMessages.value.push({
-      role: result.code === 0 ? 'system' : 'error',
-      text: result.stdout || result.stderr || result.outputText || '批次任務完成'
-    })
-    await refreshOutputs()
-    await refreshRuns()
-    await refreshLogs()
+    busy.value = true
+    await bridge().saveConfig(configText.value)
+    showToast('Config saved')
   } catch (error: any) {
-    console.error('runBatch failed:', error)
-    chatMessages.value.push({
-      role: 'error',
-      text: `${error?.name ?? 'Error'}: ${error?.message ?? error}`
-    })
+    showToast(`Config 儲存失敗：${error?.message ?? error}`)
   } finally {
     busy.value = false
-    await refreshStatus()
+  }
+}
+
+async function runChat() {
+  if (!chatPrompt.value.trim()) {
+    showToast('請輸入 prompt')
+    return
+  }
+
+  try {
+    chatBusy.value = true
+    chatResult.value = ''
+
+    const result = await bridge().runPrompt(chatPrompt.value)
+    chatResult.value = result?.output || result?.stdout || result?.message || JSON.stringify(result, null, 2)
+
+    showToast('Chat completed')
+  } catch (error: any) {
+    chatResult.value = error?.message ?? String(error)
+    showToast(`Chat 失敗：${error?.message ?? error}`)
+  } finally {
+    chatBusy.value = false
   }
 }
 
 async function refreshTasksMeta() {
   try {
-    tasksMeta.value = await bridge().listTaskMeta()
+    const result = await bridge().listTaskMeta()
+    taskList.value = result || []
+
+    if (selectedTask.value) {
+      const updated = taskList.value.find((item) => item.id === selectedTask.value?.id)
+      selectedTask.value = updated ? JSON.parse(JSON.stringify(updated)) : selectedTask.value
+    }
   } catch (error: any) {
-    console.error('refreshTasksMeta failed:', error)
-    showToast(`Task 讀取失敗：${error?.message ?? error}`)
+    showToast(`Tasks 讀取失敗：${error?.message ?? error}`)
   }
 }
 
-async function createNewTask() {
-  try {
-    const task = await bridge().newTaskMeta()
-    task.title = 'New Task'
-    task.schedule.date = today()
-    selectedTask.value = task
-    showToast('已建立新 Task 草稿')
-  } catch (error: any) {
-    console.error('createNewTask failed:', error)
-    showToast(`新增失敗：${error?.message ?? error}`)
-  }
+function createTask() {
+  selectedTask.value = newTaskTemplate()
 }
 
-async function selectTask(task: TaskMeta) {
-  const copied = JSON.parse(JSON.stringify(task)) as TaskMeta
-  if (!copied.schedule.date) copied.schedule.date = today()
-  if (!copied.schedule.daysOfWeek) copied.schedule.daysOfWeek = []
-  selectedTask.value = copied
+function selectTask(task: TaskMeta) {
+  selectedTask.value = JSON.parse(JSON.stringify(task))
 }
 
-async function saveSelectedTask() {
-  if (!selectedTask.value) {
-    showToast('請先選擇或新增 Task')
-    return
-  }
-
-  try {
-    const plainTask = toPlainTask(selectedTask.value)
-
-    if (!plainTask.id?.trim()) {
-      showToast('Task ID 不可為空')
-      return
-    }
-
-    if (!plainTask.title?.trim()) {
-      showToast('Title 不可為空')
-      return
-    }
-
-    if (!plainTask.prompt?.trim()) {
-      showToast('Prompt 不可為空')
-      return
-    }
-
-    plainTask.schedule = {
-      enabled: plainTask.schedule?.enabled ?? false,
-      type: plainTask.schedule?.type ?? 'manual',
-      date: plainTask.schedule?.date ?? '',
-      time: plainTask.schedule?.time ?? '09:00',
-      daysOfWeek: plainTask.schedule?.daysOfWeek ?? [],
-      repeat: plainTask.schedule?.repeat ?? false
-    }
-
-    selectedTask.value = await bridge().saveTaskMeta(plainTask)
-
-    showToast('Task 已儲存')
-    await refreshTasksMeta()
-  } catch (error: any) {
-    console.error('saveSelectedTask failed:', error)
-    showToast(`儲存失敗：${error?.message ?? error}`)
-  }
-}
-
-async function deleteSelectedTask() {
+async function saveTask() {
   if (!selectedTask.value) return
-  if (!confirm(`確定刪除 ${selectedTask.value.title}？`)) return
 
   try {
+    taskBusy.value = true
+    selectedTask.value.updatedAt = new Date().toISOString()
+
+    await bridge().saveTaskMeta(toPlainTask(selectedTask.value))
+    await refreshTasksMeta()
+
+    showToast('Task saved')
+  } catch (error: any) {
+    showToast(`Task 儲存失敗：${error?.message ?? error}`)
+  } finally {
+    taskBusy.value = false
+  }
+}
+
+async function deleteTask() {
+  if (!selectedTask.value) return
+
+  if (!confirm(`確定刪除 task：${selectedTask.value.title}？`)) return
+
+  try {
+    taskBusy.value = true
     await bridge().deleteTaskMeta(selectedTask.value.id)
-    showToast('Task 已刪除')
     selectedTask.value = null
     await refreshTasksMeta()
+    showToast('Task deleted')
   } catch (error: any) {
-    console.error('deleteSelectedTask failed:', error)
-    showToast(`刪除失敗：${error?.message ?? error}`)
+    showToast(`Task 刪除失敗：${error?.message ?? error}`)
+  } finally {
+    taskBusy.value = false
   }
 }
 
 async function runSelectedTask() {
-  if (!selectedTask.value || busy.value) return
+  if (!selectedTask.value) return
 
   try {
-    await saveSelectedTask()
-    if (!selectedTask.value) return
+    taskBusy.value = true
+    const result: RunResult = await bridge().runTaskMeta(selectedTask.value.id)
 
-    busy.value = true
-
-    const plainTask = toPlainTask(selectedTask.value)
-    const result = await bridge().runTaskMeta(plainTask.id)
-
-    lastRun.value = result
-
-    if (result.code === 0) {
-      showToast('Task 執行成功')
-    } else {
-      console.error('Task run failed:', result.stderr || result.stdout)
-      showToast(`Task 執行失敗：${result.stderr || result.stdout || 'unknown error'}`)
-    }
-
+    showToast(result?.ok ? 'Task completed' : 'Task failed')
     await refreshTasksMeta()
     await refreshRuns()
-    await refreshOutputs()
   } catch (error: any) {
-    console.error('runSelectedTask failed:', error)
-    showToast(`執行失敗：${error?.message ?? error}`)
+    showToast(`Task 執行失敗：${error?.message ?? error}`)
   } finally {
-    busy.value = false
-    await refreshStatus()
+    taskBusy.value = false
   }
 }
 
@@ -278,37 +285,16 @@ async function createOrUpdateSchedule() {
   if (!selectedTask.value) return
 
   try {
-    await saveSelectedTask()
-    if (!selectedTask.value) return
+    taskBusy.value = true
 
-    const plainTask = toPlainTask(selectedTask.value)
+    await saveTask()
+    await bridge().createOrUpdateSchedule(selectedTask.value.id)
 
-    if (!plainTask.schedule.enabled || plainTask.schedule.type === 'manual') {
-      showToast('請先啟用排程，並選擇 once / daily / weekly')
-      return
-    }
-
-    if (!plainTask.schedule.time) {
-      showToast('請填寫排程時間')
-      return
-    }
-
-    if (plainTask.schedule.type === 'once' && !plainTask.schedule.date) {
-      showToast('一次性排程需要日期')
-      return
-    }
-
-    if (plainTask.schedule.type === 'weekly' && (!plainTask.schedule.daysOfWeek || plainTask.schedule.daysOfWeek.length === 0)) {
-      showToast('每週排程至少要選一天')
-      return
-    }
-
-    const result = await bridge().createOrUpdateSchedule(plainTask)
-
-    showToast(`已建立/更新排程：${result.taskName}`)
+    showToast('Schedule updated')
   } catch (error: any) {
-    console.error('createOrUpdateSchedule failed:', error)
-    showToast(`建立排程失敗：${error?.message ?? error}`)
+    showToast(`Schedule 更新失敗：${error?.message ?? error}`)
+  } finally {
+    taskBusy.value = false
   }
 }
 
@@ -316,130 +302,288 @@ async function deleteSchedule() {
   if (!selectedTask.value) return
 
   try {
-    const plainTask = toPlainTask(selectedTask.value)
-    const result = await bridge().deleteSchedule(plainTask.id)
-
-    if (result.code === 0) {
-      showToast(`已刪除排程：${result.taskName}`)
-    } else {
-      showToast(result.stderr || result.stdout || '刪除排程失敗')
-    }
+    taskBusy.value = true
+    await bridge().deleteSchedule(selectedTask.value.id)
+    showToast('Schedule deleted')
   } catch (error: any) {
-    console.error('deleteSchedule failed:', error)
-    showToast(`刪除排程失敗：${error?.message ?? error}`)
-  }
-}
-
-function toggleWeekday(value: string) {
-  if (!selectedTask.value) return
-
-  const days = selectedTask.value.schedule.daysOfWeek || []
-
-  if (days.includes(value)) {
-    selectedTask.value.schedule.daysOfWeek = days.filter((x) => x !== value)
-  } else {
-    selectedTask.value.schedule.daysOfWeek = [...days, value]
+    showToast(`Schedule 刪除失敗：${error?.message ?? error}`)
+  } finally {
+    taskBusy.value = false
   }
 }
 
 async function refreshOutputs() {
   try {
-    outputs.value = await bridge().listOutputs()
+    outputList.value = await bridge().listOutputs()
   } catch (error: any) {
-    console.error('refreshOutputs failed:', error)
     showToast(`Outputs 讀取失敗：${error?.message ?? error}`)
   }
 }
 
-async function loadOutput(name: string) {
-  try {
-    selectedOutputName.value = name
-    selectedOutputContent.value = await bridge().readOutputFile(name)
-  } catch (error: any) {
-    console.error('loadOutput failed:', error)
-    showToast(`Output 讀取失敗：${error?.message ?? error}`)
-  }
-}
+async function selectOutput(item: FileItem) {
+  selectedOutput.value = item
 
-async function loadLatestOutput() {
   try {
-    selectedOutputName.value = 'output.txt'
-    selectedOutputContent.value = await bridge().readOutput()
+    outputContent.value = await bridge().readOutput(item.name)
   } catch (error: any) {
-    console.error('loadLatestOutput failed:', error)
-    showToast(`output.txt 讀取失敗：${error?.message ?? error}`)
+    outputContent.value = error?.message ?? String(error)
   }
 }
 
 async function refreshRuns() {
   try {
-    runs.value = await bridge().listRuns()
+    runList.value = await bridge().listRuns()
+
+    if (selectedRun.value) {
+      const updated = runList.value.find((item) => item.file === selectedRun.value?.file)
+      selectedRun.value = updated || selectedRun.value
+    }
   } catch (error: any) {
-    console.error('refreshRuns failed:', error)
     showToast(`Runs 讀取失敗：${error?.message ?? error}`)
   }
 }
 
-async function selectRun(run: RunRecord) {
+async function selectRun(item: RunRecord) {
+  selectedRun.value = item
+
   try {
-    if (!run.fileName) return
-    selectedRun.value = await bridge().readRun(run.fileName)
+    runContent.value = await bridge().readRun(item.file)
   } catch (error: any) {
-    console.error('selectRun failed:', error)
-    showToast(`Run 讀取失敗：${error?.message ?? error}`)
+    runContent.value = error?.message ?? String(error)
   }
 }
 
 async function refreshLogs() {
   try {
-    logContent.value = await bridge().readLog(selectedLog.value)
+    logsText.value = await bridge().readLogs()
   } catch (error: any) {
-    console.error('refreshLogs failed:', error)
-    showToast(`Log 讀取失敗：${error?.message ?? error}`)
+    logsText.value = error?.message ?? String(error)
   }
 }
 
-async function refreshConfig() {
+async function refreshMcpPage() {
   try {
-    configContent.value = await bridge().readConfig()
+    mcpBusy.value = true
+
+    const [health, security, approvals, audit, configResult, serverResult] = await Promise.all([
+      bridge().apiHealth(),
+      bridge().getMcpSecurity(),
+      bridge().listMcpApprovals(),
+      bridge().getMcpAudit(100),
+      bridge().getMcpConfig(),
+      bridge().listMcpServers()
+    ])
+
+    mcpHealth.value = health
+    mcpSecurity.value = security
+    mcpApprovals.value = approvals?.data || []
+    mcpAudit.value = audit?.data || []
+    mcpConfigText.value = formatJson(configResult?.config || { servers: {} })
+    mcpServers.value = serverResult?.servers || []
+
+    if (selectedMcpApproval.value) {
+      const updated = mcpApprovals.value.find((item) => item.id === selectedMcpApproval.value?.id)
+      selectedMcpApproval.value = updated ? JSON.parse(JSON.stringify(updated)) : selectedMcpApproval.value
+    }
   } catch (error: any) {
-    console.error('refreshConfig failed:', error)
-    showToast(`Config 讀取失敗：${error?.message ?? error}`)
+    showToast(`MCP 讀取失敗：${error?.message ?? error}`)
+  } finally {
+    mcpBusy.value = false
   }
 }
 
-async function saveConfig() {
+async function refreshMcpConfig() {
   try {
-    await bridge().saveConfig(configContent.value)
-    showToast('config.yaml 已儲存')
+    mcpConfigBusy.value = true
+
+    const [configResult, serverResult] = await Promise.all([
+      bridge().getMcpConfig(),
+      bridge().listMcpServers()
+    ])
+
+    mcpConfigText.value = formatJson(configResult?.config || { servers: {} })
+    mcpServers.value = serverResult?.servers || []
   } catch (error: any) {
-    console.error('saveConfig failed:', error)
-    showToast(`Config 儲存失敗：${error?.message ?? error}`)
+    showToast(`MCP config 讀取失敗：${error?.message ?? error}`)
+  } finally {
+    mcpConfigBusy.value = false
   }
 }
 
-async function openProjectFolder() {
-  await bridge().openProjectFolder()
+async function saveMcpConfig() {
+  try {
+    mcpConfigBusy.value = true
+
+    const parsed = JSON.parse(mcpConfigText.value)
+
+    await bridge().saveMcpConfig(parsed)
+    await refreshMcpPage()
+
+    showToast('MCP servers config saved and reloaded')
+  } catch (error: any) {
+    showToast(`MCP config 儲存失敗：${error?.message ?? error}`)
+  } finally {
+    mcpConfigBusy.value = false
+  }
 }
 
-async function openOutputsFolder() {
-  await bridge().openOutputsFolder()
+async function reloadMcpServers() {
+  try {
+    mcpConfigBusy.value = true
+
+    await bridge().reloadMcpServers()
+    await refreshMcpPage()
+
+    showToast('MCP servers reloaded')
+  } catch (error: any) {
+    showToast(`MCP reload 失敗：${error?.message ?? error}`)
+  } finally {
+    mcpConfigBusy.value = false
+  }
 }
 
-async function openRunsFolder() {
-  await bridge().openRunsFolder()
+function insertMcpServerTemplate(name: string, serverConfig: any) {
+  try {
+    const parsed = JSON.parse(mcpConfigText.value || '{"servers":{}}')
+
+    if (!parsed.servers) parsed.servers = {}
+
+    let finalName = name
+    let index = 1
+
+    while (parsed.servers[finalName]) {
+      finalName = `${name}_${index}`
+      index += 1
+    }
+
+    parsed.servers[finalName] = serverConfig
+    mcpConfigText.value = formatJson(parsed)
+
+    showToast(`Inserted ${finalName}`)
+  } catch (error: any) {
+    showToast(`插入 template 失敗：${error?.message ?? error}`)
+  }
+}
+
+function insertStdioMcpTemplate() {
+  insertMcpServerTemplate('new_stdio_server', {
+    enabled: true,
+    transport: 'stdio',
+    command: 'npx',
+    args: ['-y', 'package-name-here'],
+    env: {}
+  })
+}
+
+function insertHttpMcpTemplate() {
+  insertMcpServerTemplate('new_http_server', {
+    enabled: false,
+    transport: 'streamable_http',
+    url: 'http://127.0.0.1:3000/mcp',
+    headers: {},
+    timeout_seconds: 30
+  })
+}
+
+function selectMcpApproval(item: McpApproval) {
+  selectedMcpApproval.value = JSON.parse(JSON.stringify(item))
+}
+
+async function approveSelectedMcpCall() {
+  if (!selectedMcpApproval.value) {
+    showToast('請先選擇一筆 approval')
+    return
+  }
+
+  if (selectedMcpApproval.value.status !== 'pending') {
+    showToast('這筆 approval 不是 pending 狀態')
+    return
+  }
+
+  const pendingId = selectedMcpApproval.value.id
+
+  if (!confirm(`確定 approve？\n\nID: ${pendingId}\nTool: ${selectedMcpApproval.value.tool}`)) {
+    return
+  }
+
+  try {
+    mcpBusy.value = true
+
+    const result = await bridge().approveMcpCall(pendingId)
+
+    showToast(`已 approve：${pendingId}`)
+
+    if (result?.approval) {
+      selectedMcpApproval.value = {
+        ...selectedMcpApproval.value,
+        status: result.approval.status || 'approved_executed',
+        result: result.approval.result || '',
+        error: result.approval.error || '',
+        updatedAt: new Date().toISOString()
+      }
+    }
+
+    await refreshMcpPage()
+  } catch (error: any) {
+    showToast(`Approve 失敗：${error?.message ?? error}`)
+  } finally {
+    mcpBusy.value = false
+  }
+}
+
+async function denySelectedMcpCall() {
+  if (!selectedMcpApproval.value) {
+    showToast('請先選擇一筆 approval')
+    return
+  }
+
+  if (selectedMcpApproval.value.status !== 'pending') {
+    showToast('這筆 approval 不是 pending 狀態')
+    return
+  }
+
+  const pendingId = selectedMcpApproval.value.id
+
+  if (!confirm(`確定 deny？\n\nID: ${pendingId}`)) {
+    return
+  }
+
+  try {
+    mcpBusy.value = true
+
+    await bridge().denyMcpCall(pendingId)
+
+    showToast(`已 deny：${pendingId}`)
+    await refreshMcpPage()
+  } catch (error: any) {
+    showToast(`Deny 失敗：${error?.message ?? error}`)
+  } finally {
+    mcpBusy.value = false
+  }
+}
+
+async function openFolder(kind: string) {
+  try {
+    await bridge().openFolder(kind)
+  } catch (error: any) {
+    showToast(`開啟資料夾失敗：${error?.message ?? error}`)
+  }
 }
 
 async function switchPage(next: Page) {
   page.value = next
+
   if (next === 'dashboard') {
     await refreshStatus()
     await refreshTasksMeta()
     await refreshRuns()
+    await refreshMcpPage()
   }
+
   if (next === 'tasks') await refreshTasksMeta()
   if (next === 'outputs') await refreshOutputs()
   if (next === 'runs') await refreshRuns()
+  if (next === 'mcp') await refreshMcpPage()
   if (next === 'logs') await refreshLogs()
   if (next === 'settings') await refreshConfig()
 }
@@ -447,8 +591,8 @@ async function switchPage(next: Page) {
 onMounted(async () => {
   await refreshStatus()
   await refreshTasksMeta()
-  await refreshOutputs()
   await refreshRuns()
+  await refreshMcpPage()
 })
 </script>
 
@@ -456,331 +600,545 @@ onMounted(async () => {
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">A</div>
+        <div class="brand-mark">D</div>
         <div>
-          <div class="brand-title">Auto GPT</div>
-          <div class="brand-subtitle">Local UI</div>
+          <h1>DevTools Radar</h1>
+          <p>Local</p>
         </div>
       </div>
 
       <nav class="nav">
-        <button :class="{ active: page === 'dashboard' }" @click="switchPage('dashboard')">Dashboard</button>
-        <button :class="{ active: page === 'chat' }" @click="switchPage('chat')">Chat</button>
-        <button :class="{ active: page === 'tasks' }" @click="switchPage('tasks')">Tasks</button>
-        <button :class="{ active: page === 'outputs' }" @click="switchPage('outputs')">Outputs</button>
-        <button :class="{ active: page === 'runs' }" @click="switchPage('runs')">Runs</button>
-        <button :class="{ active: page === 'logs' }" @click="switchPage('logs')">Logs</button>
-        <button :class="{ active: page === 'settings' }" @click="switchPage('settings')">Settings</button>
+        <button :class="{ active: page === 'dashboard' }" @click="switchPage('dashboard')">
+          Dashboard
+        </button>
+
+        <button :class="{ active: page === 'chat' }" @click="switchPage('chat')">
+          Chat
+        </button>
+
+        <button :class="{ active: page === 'tasks' }" @click="switchPage('tasks')">
+          Tasks
+        </button>
+
+        <button :class="{ active: page === 'outputs' }" @click="switchPage('outputs')">
+          Outputs
+        </button>
+
+        <button :class="{ active: page === 'runs' }" @click="switchPage('runs')">
+          Runs
+        </button>
+
+        <button :class="{ active: page === 'mcp' }" @click="switchPage('mcp')">
+          <span>MCP</span>
+          <span v-if="pendingApprovalCount > 0" class="nav-badge">
+            {{ pendingApprovalCount }}
+          </span>
+        </button>
+
+        <button :class="{ active: page === 'logs' }" @click="switchPage('logs')">
+          Logs
+        </button>
+
+        <button :class="{ active: page === 'settings' }" @click="switchPage('settings')">
+          Settings
+        </button>
       </nav>
 
-      <div class="status-card">
-        <div class="status-row">
-          <span>Python</span>
-          <strong :class="status?.pythonExists ? 'ok' : 'bad'">{{ status?.pythonExists ? 'OK' : 'Missing' }}</strong>
-        </div>
-        <div class="status-row">
-          <span>main.py</span>
-          <strong :class="status?.mainPyExists ? 'ok' : 'bad'">{{ status?.mainPyExists ? 'OK' : 'Missing' }}</strong>
-        </div>
-        <div class="status-row">
-          <span>task_runner</span>
-          <strong :class="status?.taskRunnerExists ? 'ok' : 'bad'">{{ status?.taskRunnerExists ? 'OK' : 'Missing' }}</strong>
-        </div>
-        <div class="status-row">
-          <span>Runner</span>
-          <strong :class="status?.runnerLocked ? 'warn' : 'ok'">{{ status?.runnerLocked ? 'Busy' : 'Idle' }}</strong>
-        </div>
-        <button class="small-btn" @click="refreshStatus">Refresh</button>
+      <div class="sidebar-footer">
+        <button @click="openFolder('root')">Open Root</button>
+        <button @click="openFolder('outputs')">Open Outputs</button>
       </div>
-
-      <button class="ghost-btn" @click="openProjectFolder">Open Folder</button>
     </aside>
 
     <main class="main">
       <header class="topbar">
         <div>
-          <h1>{{ pageTitle }}</h1>
-          <p>D:\side_project\auto_gpt</p>
+          <h2>{{ pageTitle }}</h2>
+          <p v-if="status">
+            Python: {{ status.python || 'unknown' }} · Root: {{ status.root || '' }}
+          </p>
         </div>
-        <div v-if="busy" class="running-pill">Running...</div>
+
+        <button class="small-btn" @click="refreshStatus">Refresh</button>
       </header>
 
-      <section v-if="page === 'dashboard'" class="page">
-        <div class="dashboard-grid">
-          <div class="panel">
-            <h2>System</h2>
-            <div class="kv"><span>Project</span><strong>{{ status?.projectRoot }}</strong></div>
-            <div class="kv"><span>Python</span><strong>{{ status?.pythonExists ? 'OK' : 'Missing' }}</strong></div>
-            <div class="kv"><span>main.py</span><strong>{{ status?.mainPyExists ? 'OK' : 'Missing' }}</strong></div>
-            <div class="kv"><span>task_runner.py</span><strong>{{ status?.taskRunnerExists ? 'OK' : 'Missing' }}</strong></div>
-            <div class="kv"><span>Runner</span><strong>{{ status?.runnerLocked ? 'Busy' : 'Idle' }}</strong></div>
+      <section v-if="page === 'dashboard'" class="page dashboard-grid">
+        <div class="panel stat-card">
+          <span>Status</span>
+          <strong :class="status?.ok ? 'ok' : 'warn'">
+            {{ status?.ok ? 'OK' : 'Check' }}
+          </strong>
+        </div>
+
+        <div class="panel stat-card">
+          <span>Tasks</span>
+          <strong>{{ taskList.length }}</strong>
+        </div>
+
+        <div class="panel stat-card">
+          <span>Runs</span>
+          <strong>{{ runList.length }}</strong>
+        </div>
+
+        <div class="panel stat-card">
+          <span>MCP Pending</span>
+          <strong :class="pendingApprovalCount > 0 ? 'warn' : 'ok'">
+            {{ pendingApprovalCount }}
+          </strong>
+        </div>
+
+        <div class="panel wide-panel">
+          <div class="panel-header">
+            <h3>Recent Runs</h3>
+            <button class="small-btn" @click="switchPage('runs')">View</button>
           </div>
 
-          <div class="panel">
-            <h2>Tasks</h2>
-            <div class="big-number">{{ tasksMeta.length }}</div>
-            <p class="muted">JSON tasks in tasks_meta/</p>
-            <button class="primary-btn" @click="switchPage('tasks')">Manage Tasks</button>
+          <div class="simple-list">
+            <button v-for="item in runList.slice(0, 8)" :key="item.file" @click="switchPage('runs')">
+              <strong>{{ item.title || item.file }}</strong>
+              <span>{{ item.status }} · {{ formatTime(item.createdAt) }}</span>
+            </button>
+
+            <p v-if="runList.length === 0" class="muted">No runs yet.</p>
+          </div>
+        </div>
+
+        <div class="panel wide-panel">
+          <div class="panel-header">
+            <h3>MCP Pending Approvals</h3>
+            <button class="small-btn" @click="switchPage('mcp')">View</button>
           </div>
 
-          <div class="panel">
-            <h2>Runs</h2>
-            <div class="big-number">{{ runs.length }}</div>
-            <p class="muted">Execution records</p>
-            <button class="secondary-btn" @click="switchPage('runs')">View Runs</button>
+          <div class="simple-list">
+            <button
+              v-for="item in mcpApprovals.filter((x) => x.status === 'pending').slice(0, 8)"
+              :key="item.id"
+              @click="switchPage('mcp')"
+            >
+              <strong>{{ item.tool }}</strong>
+              <span>{{ item.id }} · {{ formatTime(item.createdAt) }}</span>
+            </button>
+
+            <p v-if="pendingApprovalCount === 0" class="muted">No pending MCP approvals.</p>
           </div>
         </div>
       </section>
 
       <section v-if="page === 'chat'" class="page chat-page">
-        <div class="chat-window">
-          <div v-if="chatMessages.length === 0" class="empty-state">
-            <h2>開始本機 ChatGPT 自動化</h2>
-            <p>輸入 prompt 後，會呼叫 main.py，透過 Edge CDP 操作 ChatGPT Web UI。</p>
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Prompt</h3>
+            <button class="primary-btn" :disabled="chatBusy" @click="runChat">
+              {{ chatBusy ? 'Running...' : 'Run' }}
+            </button>
           </div>
 
-          <div v-for="(msg, index) in chatMessages" :key="index" class="message" :class="msg.role">
-            <div class="message-role">{{ msg.role }}</div>
-            <pre>{{ msg.text }}</pre>
-          </div>
-        </div>
+          <textarea v-model="chatPrompt" class="big-textarea" placeholder="輸入 prompt..." />
 
-        <div class="composer">
-          <textarea
-            v-model="chatInput"
-            placeholder="輸入訊息..."
-            :disabled="busy"
-            @keydown.ctrl.enter.prevent="sendPrompt"
-          />
-          <div class="composer-actions">
-            <button class="secondary-btn" :disabled="busy" @click="runBatch">Run tasks/</button>
-            <button class="primary-btn" :disabled="busy || !chatInput.trim()" @click="sendPrompt">Send</button>
-          </div>
+          <h3>Result</h3>
+          <pre class="content-view">{{ chatResult }}</pre>
         </div>
       </section>
 
-      <section v-if="page === 'tasks'" class="page split-page">
+      <section v-if="page === 'tasks'" class="page two-col">
         <div class="panel list-panel">
           <div class="panel-header">
-            <h2>Tasks</h2>
-            <button class="small-btn" @click="createNewTask">New</button>
+            <h3>Tasks</h3>
+            <button class="small-btn" @click="createTask">New</button>
           </div>
 
           <div class="file-list">
             <button
-              v-for="task in tasksMeta"
+              v-for="task in taskList"
               :key="task.id"
               :class="{ selected: selectedTask?.id === task.id }"
               @click="selectTask(task)"
             >
               <strong>{{ task.title }}</strong>
-              <span>{{ task.schedule?.enabled ? `${task.schedule.type} ${task.schedule.time}` : 'manual' }}</span>
-              <span>Status: {{ task.lastStatus || 'never' }}</span>
+              <span>{{ task.enabled ? 'enabled' : 'disabled' }} · {{ task.schedule?.type }}</span>
+              <span>{{ task.id }}</span>
             </button>
 
-            <div v-if="tasksMeta.length === 0" class="muted">尚無 JSON task</div>
+            <p v-if="taskList.length === 0" class="muted">No tasks yet.</p>
           </div>
         </div>
 
-        <div class="panel editor-panel" v-if="selectedTask">
+        <div class="panel detail-panel" v-if="selectedTask">
+          <div class="panel-header">
+            <h3>{{ selectedTask.title || 'Task' }}</h3>
+            <div class="inline-actions">
+              <button class="small-btn" :disabled="taskBusy" @click="saveTask">Save</button>
+              <button class="primary-btn" :disabled="taskBusy" @click="runSelectedTask">Run</button>
+              <button class="danger-btn" :disabled="taskBusy" @click="deleteTask">Delete</button>
+            </div>
+          </div>
+
+          <label>
+            Title
+            <input v-model="selectedTask.title" />
+          </label>
+
+          <label class="checkbox-row">
+            <input v-model="selectedTask.enabled" type="checkbox" />
+            Enabled
+          </label>
+
+          <label>
+            Conversation Mode
+            <select v-model="selectedTask.conversationMode">
+              <option value="same">same</option>
+              <option value="new">new</option>
+            </select>
+          </label>
+
+          <label>
+            Prompt
+            <textarea v-model="selectedTask.prompt" class="big-textarea" />
+          </label>
+
           <div class="form-grid">
-            <div class="form-row">
-              <label>Title</label>
-              <input v-model="selectedTask.title" />
-            </div>
+            <label class="checkbox-row">
+              <input v-model="selectedTask.schedule.enabled" type="checkbox" />
+              Schedule Enabled
+            </label>
 
-            <div class="form-row">
-              <label>ID</label>
-              <input v-model="selectedTask.id" />
-            </div>
-
-            <div class="form-row">
-              <label>Conversation</label>
-              <select v-model="selectedTask.conversationMode">
-                <option value="same">沿用目前對話</option>
-                <option value="new">新對話</option>
+            <label>
+              Type
+              <select v-model="selectedTask.schedule.type">
+                <option value="manual">manual</option>
+                <option value="once">once</option>
+                <option value="daily">daily</option>
+                <option value="weekly">weekly</option>
               </select>
-            </div>
+            </label>
 
-            <div class="form-row">
-              <label>Enabled</label>
-              <select v-model="selectedTask.enabled">
-                <option :value="true">啟用</option>
-                <option :value="false">停用</option>
-              </select>
-            </div>
+            <label>
+              Date
+              <input v-model="selectedTask.schedule.date" type="date" />
+            </label>
+
+            <label>
+              Time
+              <input v-model="selectedTask.schedule.time" type="time" />
+            </label>
           </div>
 
-          <textarea
-            v-model="selectedTask.prompt"
-            class="large-editor"
-            placeholder="任務 prompt，可使用 {{date}} {{time}} {{datetime}}"
-          />
+          <div class="inline-actions">
+            <button class="small-btn" :disabled="taskBusy" @click="createOrUpdateSchedule">
+              Update Schedule
+            </button>
 
-          <div class="schedule-box">
-            <h3>Schedule</h3>
-
-            <div class="form-grid">
-              <div class="form-row">
-                <label>啟用排程</label>
-                <select v-model="selectedTask.schedule.enabled">
-                  <option :value="false">否</option>
-                  <option :value="true">是</option>
-                </select>
-              </div>
-
-              <div class="form-row">
-                <label>類型</label>
-                <select v-model="selectedTask.schedule.type">
-                  <option value="manual">手動</option>
-                  <option value="once">一次性</option>
-                  <option value="daily">每日</option>
-                  <option value="weekly">每週</option>
-                </select>
-              </div>
-
-              <div class="form-row" v-if="selectedTask.schedule.type === 'once'">
-                <label>日期</label>
-                <input v-model="selectedTask.schedule.date" type="date" />
-              </div>
-
-              <div class="form-row">
-                <label>時間</label>
-                <input v-model="selectedTask.schedule.time" type="time" />
-              </div>
-            </div>
-
-            <div v-if="selectedTask.schedule.type === 'weekly'" class="weekday-row">
-              <button
-                v-for="d in weekDays"
-                :key="d.value"
-                :class="{ active: selectedTask.schedule.daysOfWeek?.includes(d.value) }"
-                @click="toggleWeekday(d.value)"
-              >
-                {{ d.label }}
-              </button>
-            </div>
+            <button class="danger-btn" :disabled="taskBusy" @click="deleteSchedule">
+              Delete Schedule
+            </button>
           </div>
 
-          <div class="actions-row">
-            <button class="primary-btn" @click="saveSelectedTask">Save</button>
-            <button class="secondary-btn" :disabled="busy" @click="runSelectedTask">Run Now</button>
-            <button class="secondary-btn" @click="createOrUpdateSchedule">Create / Update Schedule</button>
-            <button class="danger-btn" @click="deleteSchedule">Delete Schedule</button>
-            <button class="danger-btn" @click="deleteSelectedTask">Delete Task</button>
-          </div>
-
-          <div class="meta-box">
-            <div>Last run: {{ formatTime(selectedTask.lastRunAt) }}</div>
-            <div>Status: {{ selectedTask.lastStatus }}</div>
-            <div v-if="selectedTask.lastRunFile">Run file: {{ selectedTask.lastRunFile }}</div>
+          <div class="muted">
+            Last: {{ selectedTask.lastStatus || 'none' }} · {{ formatTime(selectedTask.lastRunAt) }}
           </div>
         </div>
 
         <div class="panel empty-state" v-else>
-          <h2>選擇或新增一個 task</h2>
+          <h3>Select or create a task</h3>
         </div>
       </section>
 
-      <section v-if="page === 'outputs'" class="page split-page">
+      <section v-if="page === 'outputs'" class="page two-col">
         <div class="panel list-panel">
           <div class="panel-header">
-            <h2>Outputs</h2>
+            <h3>Outputs</h3>
             <button class="small-btn" @click="refreshOutputs">Refresh</button>
           </div>
 
-          <button class="wide-btn" @click="loadLatestOutput">Load output.txt</button>
-          <button class="wide-btn" @click="openOutputsFolder">Open outputs/</button>
-
           <div class="file-list">
             <button
-              v-for="item in outputs"
+              v-for="item in outputList"
               :key="item.name"
-              :class="{ selected: selectedOutputName === item.name }"
-              @click="loadOutput(item.name)"
+              :class="{ selected: selectedOutput?.name === item.name }"
+              @click="selectOutput(item)"
             >
               <strong>{{ item.name }}</strong>
               <span>{{ formatTime(item.modifiedAt) }}</span>
             </button>
+
+            <p v-if="outputList.length === 0" class="muted">No outputs.</p>
           </div>
         </div>
 
-        <div class="panel output-panel">
-          <h2>{{ selectedOutputName || '選擇一個 output' }}</h2>
-          <pre class="content-view">{{ selectedOutputContent }}</pre>
+        <div class="panel detail-panel">
+          <h3>{{ selectedOutput?.name || 'Output' }}</h3>
+          <pre class="content-view">{{ outputContent }}</pre>
         </div>
       </section>
 
-      <section v-if="page === 'runs'" class="page split-page">
+      <section v-if="page === 'runs'" class="page two-col">
         <div class="panel list-panel">
           <div class="panel-header">
-            <h2>Runs</h2>
+            <h3>Runs</h3>
             <button class="small-btn" @click="refreshRuns">Refresh</button>
           </div>
 
-          <button class="wide-btn" @click="openRunsFolder">Open runs/</button>
-
           <div class="file-list">
             <button
-              v-for="run in runs"
-              :key="run.id"
-              :class="{ selected: selectedRun?.id === run.id }"
-              @click="selectRun(run)"
+              v-for="item in runList"
+              :key="item.file"
+              :class="{ selected: selectedRun?.file === item.file }"
+              @click="selectRun(item)"
             >
-              <strong>{{ run.taskTitle || run.id }}</strong>
-              <span>{{ run.status }} · {{ formatTime(run.startedAt) }}</span>
+              <strong>{{ item.title || item.file }}</strong>
+              <span>{{ item.status }} · {{ formatTime(item.createdAt) }}</span>
             </button>
+
+            <p v-if="runList.length === 0" class="muted">No runs.</p>
           </div>
         </div>
 
-        <div class="panel output-panel" v-if="selectedRun">
-          <h2>{{ selectedRun.taskTitle || selectedRun.id }}</h2>
-          <div class="kv"><span>Status</span><strong>{{ selectedRun.status }}</strong></div>
-          <div class="kv"><span>Started</span><strong>{{ formatTime(selectedRun.startedAt) }}</strong></div>
-          <div class="kv"><span>Finished</span><strong>{{ formatTime(selectedRun.finishedAt) }}</strong></div>
+        <div class="panel detail-panel">
+          <h3>{{ selectedRun?.title || selectedRun?.file || 'Run' }}</h3>
+          <pre class="content-view">{{ runContent }}</pre>
+        </div>
+      </section>
 
-          <h3>Output</h3>
-          <pre class="content-view">{{ selectedRun.output }}</pre>
+      <section v-if="page === 'mcp'" class="page mcp-page">
+        <div class="panel mcp-server-panel">
+          <div class="panel-header">
+            <div>
+              <h3>MCP Servers</h3>
+              <p class="muted">Manage mcp_servers.json. Supports stdio and streamable_http.</p>
+            </div>
 
-          <h3 v-if="selectedRun.stderr">stderr</h3>
-          <pre v-if="selectedRun.stderr" class="content-view">{{ selectedRun.stderr }}</pre>
+            <div class="inline-actions">
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertStdioMcpTemplate">
+                Add stdio
+              </button>
+
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertHttpMcpTemplate">
+                Add HTTP
+              </button>
+
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="reloadMcpServers">
+                Reload
+              </button>
+
+              <button class="primary-btn" :disabled="mcpConfigBusy" @click="saveMcpConfig">
+                Save
+              </button>
+            </div>
+          </div>
+
+          <div class="mcp-server-list">
+            <div v-for="server in mcpServers" :key="server.name" class="mcp-server-card">
+              <div>
+                <strong>{{ server.name }}</strong>
+                <span>{{ server.transport }}</span>
+              </div>
+
+              <div>
+                <span :class="server.initialized ? 'ok' : 'warn'">
+                  {{ server.initialized ? 'initialized' : 'not initialized' }}
+                </span>
+
+                <span :class="server.running ? 'ok' : 'warn'">
+                  {{ server.running ? 'running' : 'not running' }}
+                </span>
+              </div>
+
+              <small v-if="server.url">{{ server.url }}</small>
+              <small v-else>{{ server.command }} {{ (server.args || []).join(' ') }}</small>
+            </div>
+
+            <p v-if="mcpServers.length === 0" class="muted">No enabled MCP servers.</p>
+          </div>
+
+          <textarea
+            v-model="mcpConfigText"
+            class="config-textarea mcp-config-editor"
+            spellcheck="false"
+          />
         </div>
 
-        <div class="panel empty-state" v-else>
-          <h2>選擇一筆 run</h2>
+        <div class="mcp-grid">
+          <div class="panel list-panel">
+            <div class="panel-header">
+              <h3>MCP Approvals</h3>
+              <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">
+                Refresh
+              </button>
+            </div>
+
+            <div class="mcp-status-box">
+              <div class="status-row">
+                <span>API</span>
+                <strong :class="mcpHealth?.status === 'ok' ? 'ok' : 'bad'">
+                  {{ mcpHealth?.status || 'unknown' }}
+                </strong>
+              </div>
+
+              <div class="status-row">
+                <span>Security</span>
+                <strong :class="mcpSecurity?.security?.enabled ? 'ok' : 'warn'">
+                  {{ mcpSecurity?.security?.enabled ? 'Enabled' : 'Disabled' }}
+                </strong>
+              </div>
+
+              <div class="status-row">
+                <span>Default</span>
+                <strong>{{ mcpSecurity?.security?.default_action || 'unknown' }}</strong>
+              </div>
+
+              <div class="status-row">
+                <span>Pending</span>
+                <strong :class="pendingApprovalCount > 0 ? 'warn' : 'ok'">
+                  {{ pendingApprovalCount }}
+                </strong>
+              </div>
+            </div>
+
+            <div class="file-list">
+              <button
+                v-for="item in mcpApprovals"
+                :key="item.id"
+                :class="{ selected: selectedMcpApproval?.id === item.id }"
+                @click="selectMcpApproval(item)"
+              >
+                <strong>{{ item.tool }}</strong>
+                <span :class="statusClass(item.status)">
+                  {{ item.status }} · {{ formatTime(item.createdAt) }}
+                </span>
+                <span>{{ item.id }}</span>
+              </button>
+
+              <p v-if="mcpApprovals.length === 0" class="muted">No MCP approvals.</p>
+            </div>
+          </div>
+
+          <div class="panel detail-panel" v-if="selectedMcpApproval">
+            <div class="panel-header">
+              <div>
+                <h3>{{ selectedMcpApproval.tool }}</h3>
+                <p class="muted">{{ selectedMcpApproval.id }}</p>
+              </div>
+
+              <div class="inline-actions">
+                <button
+                  class="primary-btn"
+                  :disabled="mcpBusy || selectedMcpApproval.status !== 'pending'"
+                  @click="approveSelectedMcpCall"
+                >
+                  Approve
+                </button>
+
+                <button
+                  class="danger-btn"
+                  :disabled="mcpBusy || selectedMcpApproval.status !== 'pending'"
+                  @click="denySelectedMcpCall"
+                >
+                  Deny
+                </button>
+              </div>
+            </div>
+
+            <div class="mcp-summary">
+              <div class="kv">
+                <span>Status</span>
+                <strong :class="statusClass(selectedMcpApproval.status)">
+                  {{ selectedMcpApproval.status }}
+                </strong>
+              </div>
+
+              <div class="kv">
+                <span>Action</span>
+                <strong>{{ selectedMcpApproval.decision?.action }}</strong>
+              </div>
+
+              <div class="kv">
+                <span>Created</span>
+                <strong>{{ formatTime(selectedMcpApproval.createdAt) }}</strong>
+              </div>
+
+              <div class="kv">
+                <span>Updated</span>
+                <strong>{{ formatTime(selectedMcpApproval.updatedAt) }}</strong>
+              </div>
+            </div>
+
+            <h3>Reason</h3>
+            <pre class="content-view small-view">{{ selectedMcpApproval.decision?.reason }}</pre>
+
+            <h3>Arguments</h3>
+            <pre class="content-view small-view">{{ formatJson(selectedMcpApproval.arguments) }}</pre>
+
+            <h3 v-if="selectedMcpApproval.result">Result</h3>
+            <pre v-if="selectedMcpApproval.result" class="content-view small-view">{{ selectedMcpApproval.result }}</pre>
+
+            <h3 v-if="selectedMcpApproval.error">Error</h3>
+            <pre v-if="selectedMcpApproval.error" class="content-view error-box">{{ selectedMcpApproval.error }}</pre>
+          </div>
+
+          <div class="panel empty-state" v-else>
+            <h3>Select an MCP approval</h3>
+            <p class="muted">
+              write / edit / create / move tools that require confirmation will appear here.
+            </p>
+          </div>
+        </div>
+
+        <div class="panel mcp-audit-panel">
+          <div class="panel-header">
+            <h3>MCP Audit</h3>
+            <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">
+              Refresh
+            </button>
+          </div>
+
+          <div class="audit-list">
+            <div
+              v-for="item in mcpAudit"
+              :key="`${item.time}-${item.tool}-${item.status}-${formatJson(item.arguments)}`"
+              class="audit-item"
+            >
+              <div class="audit-head">
+                <strong>{{ item.tool }}</strong>
+                <span :class="statusClass(item.status)">
+                  {{ item.status }}
+                </span>
+              </div>
+
+              <div class="muted">{{ item.time }}</div>
+
+              <pre class="audit-preview">{{ shortText(item.error || item.resultPreview || formatJson(item.arguments), 700) }}</pre>
+            </div>
+
+            <p v-if="mcpAudit.length === 0" class="muted">No MCP audit records.</p>
+          </div>
         </div>
       </section>
 
       <section v-if="page === 'logs'" class="page">
         <div class="panel">
           <div class="panel-header">
-            <h2>Logs</h2>
-            <div class="inline-actions">
-              <select v-model="selectedLog" @change="refreshLogs">
-                <option value="runner.log">runner.log</option>
-                <option value="bat.log">bat.log</option>
-              </select>
-              <button class="small-btn" @click="refreshLogs">Refresh</button>
-            </div>
+            <h3>Logs</h3>
+            <button class="small-btn" @click="refreshLogs">Refresh</button>
           </div>
-          <pre class="log-view">{{ logContent }}</pre>
+
+          <pre class="content-view">{{ logsText }}</pre>
         </div>
       </section>
 
       <section v-if="page === 'settings'" class="page">
         <div class="panel">
           <div class="panel-header">
-            <h2>config.yaml</h2>
-            <div class="inline-actions">
-              <button class="small-btn" @click="refreshConfig">Reload</button>
-              <button class="primary-btn" @click="saveConfig">Save</button>
-            </div>
+            <h3>config.yaml</h3>
+            <button class="primary-btn" :disabled="busy" @click="saveConfig">Save</button>
           </div>
-          <textarea v-model="configContent" class="config-editor" spellcheck="false" />
+
+          <textarea v-model="configText" class="config-textarea" />
         </div>
       </section>
     </main>
 
-    <div v-if="toast" class="toast">{{ toast }}</div>
+    <div v-if="toast" class="toast">
+      {{ toast }}
+    </div>
   </div>
 </template>

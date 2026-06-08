@@ -844,5 +844,20 @@ def main() -> int:
         release_lock()
 
 
+from pathlib import Path
+
+def get_prompt_from_args(args) -> str:
+    if getattr(args, "prompt_file", ""):
+        return Path(args.prompt_file).read_text(encoding="utf-8", errors="replace").strip()
+
+    if getattr(args, "prompt_text", ""):
+        return args.prompt_text.strip()
+
+    input_path = Path("input.txt")
+    if input_path.exists():
+        return input_path.read_text(encoding="utf-8", errors="replace").strip()
+
+    return ""
+
 if __name__ == "__main__":
     sys.exit(main())

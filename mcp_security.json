@@ -1,0 +1,97 @@
+{
+  "enabled": true,
+  "default_action": "deny",
+  "tool_timeout_seconds": 20,
+  "max_tool_output_chars": 12000,
+  "audit_log_enabled": true,
+
+  "allowed_roots": [
+    "D:\\side_project\\auto_gpt"
+  ],
+
+  "tool_policies": [
+    {
+      "pattern": "filesystem__read_file",
+      "action": "allow",
+      "reason": "Read-only file access inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__read_text_file",
+      "action": "allow",
+      "reason": "Read-only text file access inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__read_media_file",
+      "action": "allow",
+      "reason": "Read-only media file access inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__read_multiple_files",
+      "action": "allow",
+      "reason": "Read-only multiple file access inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__list_directory",
+      "action": "allow",
+      "reason": "Directory listing inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__list_allowed_directories",
+      "action": "allow",
+      "reason": "Read-only allowed directory listing"
+    },
+    {
+      "pattern": "filesystem__directory_tree",
+      "action": "allow",
+      "reason": "Directory tree listing inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__search_files",
+      "action": "allow",
+      "reason": "File search inside allowed roots"
+    },
+    {
+      "pattern": "filesystem__get_file_info",
+      "action": "allow",
+      "reason": "Read-only file metadata access"
+    },
+
+    {
+      "pattern": "filesystem__write_file",
+      "action": "confirm",
+      "reason": "Writing files requires explicit confirmation"
+    },
+    {
+      "pattern": "filesystem__edit_file",
+      "action": "confirm",
+      "reason": "Editing files requires explicit confirmation"
+    },
+    {
+      "pattern": "filesystem__create_directory",
+      "action": "confirm",
+      "reason": "Creating folders requires explicit confirmation"
+    },
+    {
+      "pattern": "filesystem__move_file",
+      "action": "confirm",
+      "reason": "Moving files requires explicit confirmation"
+    },
+
+    {
+      "pattern": "filesystem__delete_file",
+      "action": "deny",
+      "reason": "Deleting files is not allowed automatically"
+    },
+    {
+      "pattern": "filesystem__remove_directory",
+      "action": "deny",
+      "reason": "Deleting directories is not allowed automatically"
+    },
+
+    {
+      "pattern": "filesystem__*",
+      "action": "deny",
+      "reason": "Unlisted filesystem tool is denied by default"
+    }
+  ]
+}

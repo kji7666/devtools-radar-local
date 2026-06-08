@@ -2,6 +2,7 @@
   "servers": {
     "filesystem": {
       "enabled": true,
+      "transport": "stdio",
       "command": "npx",
       "args": [
         "-y",
@@ -9,6 +10,14 @@
         "D:\\side_project\\auto_gpt"
       ],
       "env": {}
+    },
+
+    "remote_example": {
+      "enabled": false,
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {},
+      "timeout_seconds": 30
     }
   }
 }

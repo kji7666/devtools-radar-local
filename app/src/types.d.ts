@@ -112,6 +112,63 @@ declare global {
       openProjectFolder: () => Promise<boolean>
       openOutputsFolder: () => Promise<boolean>
       openRunsFolder: () => Promise<boolean>
+      getMcpConfig: () => Promise<any>
+      saveMcpConfig: (config: any) => Promise<any>
+      listMcpServers: () => Promise<any>
+      reloadMcpServers: () => Promise<any>
     }
   }
 }
+
+export type McpApproval = {
+  id: string
+  tool: string
+  arguments: Record<string, any>
+  decision: {
+    allowed: boolean
+    action: string
+    reason: string
+    requires_confirmation: boolean
+  }
+  status: string
+  createdAt: string
+  updatedAt: string
+  result: string
+  error: string
+}
+
+export type McpAuditRecord = {
+  time: string
+  tool: string
+  arguments: Record<string, any>
+  decision: any
+  status: string
+  resultPreview: string
+  error: string
+}
+
+declare global {
+  interface Window {
+    autoGpt: {
+      [key: string]: any
+
+      apiHealth: () => Promise<any>
+
+      getMcpSecurity: () => Promise<any>
+      getMcpAudit: (limit?: number) => Promise<{
+        object: string
+        data: McpAuditRecord[]
+        count: number
+      }>
+      listMcpApprovals: () => Promise<{
+        object: string
+        data: McpApproval[]
+        count: number
+      }>
+      approveMcpCall: (pendingId: string) => Promise<any>
+      denyMcpCall: (pendingId: string) => Promise<any>
+    }
+  }
+}
+
+export {}

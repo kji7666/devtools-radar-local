@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fnmatch
 import json
 import os
 import re
@@ -9,30 +10,85 @@ import shutil
 import sys
 import time
 import uuid
+import httpx
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
 MAIN_PY = BASE_DIR / "main.py"
 OUTPUT_TXT = BASE_DIR / "output.txt"
+
 API_TMP_DIR = BASE_DIR / "api_tmp"
 API_LOG_DIR = BASE_DIR / "logs"
+
 MCP_CONFIG_PATH = BASE_DIR / "mcp_servers.json"
+MCP_SECURITY_PATH = BASE_DIR / "mcp_security.json"
+
+MCP_AUDIT_LOG = API_LOG_DIR / "mcp_audit.log"
+MCP_SECURITY_LOG = API_LOG_DIR / "mcp_security.log"
+MCP_PENDING_LOG = API_LOG_DIR / "mcp_pending.log"
 
 API_TMP_DIR.mkdir(exist_ok=True)
 API_LOG_DIR.mkdir(exist_ok=True)
 
 DEFAULT_MODEL = "chatgpt-web-local"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.4.0"
 MAX_TOOL_LOOPS = 5
 
 runner_lock = asyncio.Lock()
+pending_mcp_calls: dict[str, dict[str, Any]] = {}
 
+def load_pending_mcp_calls_from_log() -> None:
+    """
+    Rebuild pending_mcp_calls from append-only logs/mcp_pending.log.
+    The log stores multiple versions of the same pending id.
+    We keep the latest record per id.
+    """
+    pending_mcp_calls.clear()
+
+    if not MCP_PENDING_LOG.exists():
+        return
+
+    try:
+        lines = MCP_PENDING_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return
+
+    latest: dict[str, dict[str, Any]] = {}
+
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+
+        pending_id = record.get("id")
+        if not pending_id:
+            continue
+
+        latest[pending_id] = record
+
+    pending_mcp_calls.update(latest)
+
+
+def compact_pending_mcp_log() -> None:
+    """
+    Rewrite mcp_pending.log with latest records only.
+    Useful after many approvals.
+    """
+    if not pending_mcp_calls:
+        return
+
+    with MCP_PENDING_LOG.open("w", encoding="utf-8") as f:
+        for record in pending_mcp_calls.values():
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -67,9 +123,26 @@ class ModelInfo(BaseModel):
 
 class McpServerConfig(BaseModel):
     enabled: bool = True
-    command: str
+
+    # stdio or streamable_http
+    transport: str = "stdio"
+
+    # stdio fields
+    command: str = ""
     args: list[str] = []
     env: dict[str, str] = {}
+
+    # streamable_http fields
+    url: str = ""
+    headers: dict[str, str] = {}
+    timeout_seconds: int = 30
+
+
+class McpSecurityDecision(BaseModel):
+    allowed: bool
+    action: str
+    reason: str
+    requires_confirmation: bool = False
 
 
 def now_ts() -> int:
@@ -156,20 +229,24 @@ def build_messages_prompt(messages: list[ChatMessage]) -> str:
 
         if role == "system":
             rendered.append(f"[system]\n{content}")
+
         elif role == "user":
             rendered.append(f"[user]\n{content}")
+
         elif role == "assistant":
             rendered.append(f"[assistant]\n{content}")
             if msg.tool_calls:
                 rendered.append("[assistant_tool_calls]")
                 for call in msg.tool_calls:
                     rendered.append(format_tool_call_for_prompt(call))
+
         elif role == "tool":
             rendered.append(
                 f"[tool_result]\n"
                 f"tool_call_id: {msg.tool_call_id or ''}\n"
                 f"{content}"
             )
+
         else:
             rendered.append(f"[{role}]\n{content}")
 
@@ -218,7 +295,9 @@ tool_choice:
 3. 不要編造不存在的 tool name。
 4. 如果使用工具可以更準確回答，優先呼叫工具。
 5. 如果使用者已提供 tool_result，請根據 tool_result 給最終回答。
-6. 最終回答請盡量保留 Markdown。
+6. 如果工具因安全策略被拒絕，請向使用者說明原因，不要假裝已執行。
+7. 如果工具回傳 pending_id，代表該工具需要人工確認，請清楚告訴使用者 pending_id。
+8. 最終回答請盡量保留 Markdown。
 """.strip()
 
 
@@ -230,15 +309,13 @@ def build_api_prompt(
     tools_prompt = build_tools_prompt(tools, tool_choice)
     messages_prompt = build_messages_prompt(messages)
 
-    parts = []
-
-    parts.append(
+    parts = [
         """
 你是透過本機 API 包裝的 ChatGPT Web UI。
 請根據下列對話內容回答。
 請保留 Markdown 格式。
 """.strip()
-    )
+    ]
 
     if tools_prompt:
         parts.append(tools_prompt)
@@ -398,6 +475,236 @@ async def run_main_with_prompt(prompt: str, timeout_seconds: int = 900) -> tuple
             pass
 
 
+class McpSecurityManager:
+    def __init__(self):
+        self.config: dict[str, Any] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not MCP_SECURITY_PATH.exists():
+            self.config = {
+                "enabled": True,
+                "default_action": "deny",
+                "tool_timeout_seconds": 20,
+                "max_tool_output_chars": 12000,
+                "audit_log_enabled": True,
+                "allowed_roots": [str(BASE_DIR)],
+                "tool_policies": [],
+            }
+            return
+
+        try:
+            self.config = json.loads(MCP_SECURITY_PATH.read_text(encoding="utf-8"))
+        except Exception as error:
+            self.config = {
+                "enabled": True,
+                "default_action": "deny",
+                "tool_timeout_seconds": 20,
+                "max_tool_output_chars": 12000,
+                "audit_log_enabled": True,
+                "allowed_roots": [str(BASE_DIR)],
+                "tool_policies": [],
+            }
+
+            with MCP_SECURITY_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}] failed to load mcp_security.json: {error}\n")
+
+    def reload(self) -> None:
+        self.load()
+
+    def enabled(self) -> bool:
+        return bool(self.config.get("enabled", True))
+
+    def timeout_seconds(self) -> int:
+        return int(self.config.get("tool_timeout_seconds", 20))
+
+    def max_output_chars(self) -> int:
+        return int(self.config.get("max_tool_output_chars", 12000))
+
+    def default_action(self) -> str:
+        return str(self.config.get("default_action", "deny")).lower()
+
+    def allowed_roots(self) -> list[Path]:
+        roots = []
+
+        for root in self.config.get("allowed_roots", [str(BASE_DIR)]):
+            try:
+                roots.append(Path(root).resolve())
+            except Exception:
+                continue
+
+        return roots
+
+    def find_policy(self, tool_name: str) -> dict[str, Any] | None:
+        policies = self.config.get("tool_policies", [])
+
+        for policy in policies:
+            pattern = str(policy.get("pattern", ""))
+            if fnmatch.fnmatch(tool_name, pattern):
+                return policy
+
+        return None
+
+    def decide_tool(self, tool_name: str, arguments: dict[str, Any]) -> McpSecurityDecision:
+        if not self.enabled():
+            return McpSecurityDecision(
+                allowed=True,
+                action="allow",
+                reason="MCP security layer disabled",
+            )
+
+        policy = self.find_policy(tool_name)
+
+        if policy:
+            action = str(policy.get("action", "deny")).lower()
+            reason = str(policy.get("reason", "matched policy"))
+        else:
+            action = self.default_action()
+            reason = f"default_action={action}"
+
+        if action == "allow":
+            path_decision = self.check_paths(arguments)
+
+            if not path_decision.allowed:
+                return path_decision
+
+            return McpSecurityDecision(
+                allowed=True,
+                action="allow",
+                reason=reason,
+            )
+
+        if action == "confirm":
+            return McpSecurityDecision(
+                allowed=False,
+                action="confirm",
+                reason=reason,
+                requires_confirmation=True,
+            )
+
+        return McpSecurityDecision(
+            allowed=False,
+            action="deny",
+            reason=reason,
+        )
+
+    def check_paths(self, arguments: dict[str, Any]) -> McpSecurityDecision:
+        candidate_paths = self.extract_paths(arguments)
+
+        if not candidate_paths:
+            return McpSecurityDecision(
+                allowed=True,
+                action="allow",
+                reason="no path arguments",
+            )
+
+        allowed_roots = self.allowed_roots()
+
+        for raw_path in candidate_paths:
+            try:
+                candidate = Path(raw_path)
+
+                if not candidate.is_absolute():
+                    candidate = BASE_DIR / candidate
+
+                resolved = candidate.resolve()
+
+                if not any(self.is_relative_to(resolved, root) for root in allowed_roots):
+                    return McpSecurityDecision(
+                        allowed=False,
+                        action="deny",
+                        reason=f"path outside allowed roots: {resolved}",
+                    )
+
+            except Exception as error:
+                return McpSecurityDecision(
+                    allowed=False,
+                    action="deny",
+                    reason=f"invalid path argument {raw_path}: {error}",
+                )
+
+        return McpSecurityDecision(
+            allowed=True,
+            action="allow",
+            reason="all paths inside allowed roots",
+        )
+
+    def extract_paths(self, data: Any) -> list[str]:
+        result: list[str] = []
+
+        path_like_keys = {
+            "path",
+            "paths",
+            "file",
+            "files",
+            "filepath",
+            "filePath",
+            "source",
+            "destination",
+            "target",
+            "root",
+            "directory",
+        }
+
+        def walk(value: Any, key: str = "") -> None:
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    walk(v, k)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, key)
+            elif isinstance(value, str):
+                if key in path_like_keys:
+                    result.append(value)
+
+        walk(data)
+        return result
+
+    @staticmethod
+    def is_relative_to(path: Path, root: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def truncate_output(self, text: str) -> str:
+        limit = self.max_output_chars()
+
+        if len(text) <= limit:
+            return text
+
+        return (
+            text[:limit]
+            + f"\n\n[TRUNCATED: MCP tool output exceeded {limit} characters]"
+        )
+
+    def audit(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        decision: McpSecurityDecision,
+        status: str,
+        result_preview: str = "",
+        error: str = "",
+    ) -> None:
+        if not self.config.get("audit_log_enabled", True):
+            return
+
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "tool": tool_name,
+            "arguments": arguments,
+            "decision": decision.model_dump(),
+            "status": status,
+            "resultPreview": result_preview[:1000],
+            "error": error,
+        }
+
+        with MCP_AUDIT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 class McpStdioClient:
     def __init__(self, name: str, config: McpServerConfig):
         self.name = name
@@ -428,6 +735,58 @@ class McpStdioClient:
         )
 
         asyncio.create_task(self._drain_stderr())
+
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        """
+        Handle requests sent from MCP server to this client.
+        Some servers, like filesystem, may request roots/list.
+        """
+        if "id" not in message or "method" not in message:
+            return
+
+        request_id = message.get("id")
+        method = message.get("method")
+
+        if method == "roots/list":
+            roots = []
+
+            try:
+                for root in mcp_security.allowed_roots():
+                    roots.append(
+                        {
+                            "uri": root.as_uri(),
+                            "name": root.name or str(root),
+                        }
+                    )
+            except Exception:
+                roots = [
+                    {
+                        "uri": BASE_DIR.as_uri(),
+                        "name": BASE_DIR.name,
+                    }
+                ]
+
+            await self._write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "roots": roots,
+                    },
+                }
+            )
+            return
+
+        await self._write_message(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found: {method}",
+                },
+            }
+        )
 
     async def _drain_stderr(self) -> None:
         if not self.process or not self.process.stderr:
@@ -467,32 +826,32 @@ class McpStdioClient:
             return
 
         try:
-            result = await self.request(
+            await self.request(
                 "initialize",
                 {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {
                         "roots": {
-                            "listChanged": False
+                            "listChanged": False,
                         },
-                        "sampling": {}
+                        "sampling": {},
                     },
                     "clientInfo": {
                         "name": "devtools-radar-local-api",
-                        "version": SERVER_VERSION
-                    }
+                        "version": SERVER_VERSION,
+                    },
                 },
             )
         except Exception:
-            result = await self.request(
+            await self.request(
                 "initialize",
                 {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {
                         "name": "devtools-radar-local-api",
-                        "version": SERVER_VERSION
-                    }
+                        "version": SERVER_VERSION,
+                    },
                 },
             )
 
@@ -500,7 +859,7 @@ class McpStdioClient:
         self.initialized = True
 
     async def notify(self, method: str, params: Optional[dict[str, Any]] = None) -> None:
-        payload = {
+        payload: dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": method,
         }
@@ -517,7 +876,7 @@ class McpStdioClient:
             self._id += 1
             request_id = self._id
 
-            payload = {
+            payload: dict[str, Any] = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": method,
@@ -531,6 +890,10 @@ class McpStdioClient:
             while True:
                 message = await self._read_message()
 
+                if "method" in message and "id" in message:
+                    await self._handle_server_request(message)
+                    continue
+
                 if message.get("id") != request_id:
                     continue
 
@@ -543,8 +906,6 @@ class McpStdioClient:
         if not self.process or not self.process.stdin:
             raise RuntimeError(f"MCP server {self.name} is not running")
 
-        # MCP stdio transport uses newline-delimited JSON-RPC messages.
-        # Do not use LSP-style Content-Length headers here.
         raw = json.dumps(payload, ensure_ascii=False) + "\n"
 
         self.process.stdin.write(raw.encode("utf-8"))
@@ -572,7 +933,7 @@ class McpStdioClient:
                 with log_path.open("a", encoding="utf-8") as f:
                     f.write(f"[{self.name}] invalid stdout line: {text}\n")
                 continue
-            
+
     async def list_tools(self) -> list[dict[str, Any]]:
         await self.ensure_initialized()
 
@@ -606,10 +967,336 @@ class McpStdioClient:
 
         return result
 
+class McpStreamableHttpClient:
+    def __init__(self, name: str, config: McpServerConfig):
+        self.name = name
+        self.config = config
+        self._id = 0
+        self._lock = asyncio.Lock()
+        self.initialized = False
+        self.tools_cache: list[dict[str, Any]] = []
+        self.session_id: str = ""
+        self.http: Optional[httpx.AsyncClient] = None
+
+    async def start(self) -> None:
+        if self.http:
+            return
+
+        if not self.config.url:
+            raise RuntimeError(f"MCP HTTP server {self.name} missing url")
+
+        self.http = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.timeout_seconds),
+            follow_redirects=True,
+        )
+
+    async def stop(self) -> None:
+        if self.http:
+            await self.http.aclose()
+
+        self.http = None
+        self.initialized = False
+        self.tools_cache = []
+        self.session_id = ""
+
+    async def ensure_initialized(self) -> None:
+        await self.start()
+
+        if self.initialized:
+            return
+
+        try:
+            await self.request(
+                "initialize",
+                {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {
+                        "roots": {
+                            "listChanged": False,
+                        },
+                        "sampling": {},
+                    },
+                    "clientInfo": {
+                        "name": "devtools-radar-local-api",
+                        "version": SERVER_VERSION,
+                    },
+                },
+            )
+        except Exception:
+            await self.request(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "devtools-radar-local-api",
+                        "version": SERVER_VERSION,
+                    },
+                },
+            )
+
+        await self.notify("notifications/initialized", {})
+        self.initialized = True
+
+    async def notify(self, method: str, params: Optional[dict[str, Any]] = None) -> None:
+        payload: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": method,
+        }
+
+        if params is not None:
+            payload["params"] = params
+
+        await self._post_json_rpc(payload, expect_response=False)
+
+    async def request(self, method: str, params: Optional[dict[str, Any]] = None) -> Any:
+        async with self._lock:
+            await self.start()
+
+            self._id += 1
+            request_id = self._id
+
+            payload: dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+            }
+
+            if params is not None:
+                payload["params"] = params
+
+            message = await self._post_json_rpc(payload, expect_response=True)
+
+            if message.get("id") != request_id:
+                # Some HTTP MCP servers may return notifications before the target response.
+                # This minimal implementation expects one response per POST.
+                raise RuntimeError(
+                    f"Unexpected MCP response id. Expected {request_id}, got {message.get('id')}"
+                )
+
+            if "error" in message:
+                raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
+
+            return message.get("result")
+
+    async def _post_json_rpc(self, payload: dict[str, Any], expect_response: bool) -> dict[str, Any]:
+        if not self.http:
+            raise RuntimeError(f"MCP HTTP server {self.name} is not running")
+
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            **(self.config.headers or {}),
+        }
+
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+
+        response = await self.http.post(
+            self.config.url,
+            headers=headers,
+            json=payload,
+        )
+
+        session_id = response.headers.get("Mcp-Session-Id")
+        if session_id:
+            self.session_id = session_id
+
+        if not expect_response:
+            if response.status_code in {200, 202, 204}:
+                return {}
+            response.raise_for_status()
+            return {}
+
+        response.raise_for_status()
+
+        content_type = response.headers.get("content-type", "").lower()
+        text = response.text.strip()
+
+        if not text:
+            return {}
+
+        if "text/event-stream" in content_type:
+            parsed = self._parse_sse_response(text)
+            if parsed is None:
+                raise RuntimeError(f"Empty SSE response from MCP HTTP server {self.name}")
+            return parsed
+
+        try:
+            return response.json()
+        except Exception:
+            parsed = try_parse_json(text)
+            if isinstance(parsed, dict):
+                return parsed
+
+            raise RuntimeError(
+                f"Invalid MCP HTTP response from {self.name}: {text[:1000]}"
+            )
+
+    def _parse_sse_response(self, text: str) -> Optional[dict[str, Any]]:
+        """
+        Minimal SSE parser.
+        It returns the first JSON object found in data: lines.
+        """
+        data_lines: list[str] = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+
+            if not line:
+                if data_lines:
+                    joined = "\n".join(data_lines).strip()
+                    data_lines = []
+
+                    try:
+                        parsed = json.loads(joined)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        continue
+
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].strip())
+
+        if data_lines:
+            joined = "\n".join(data_lines).strip()
+            try:
+                parsed = json.loads(joined)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return None
+
+        return None
+
+    async def list_tools(self) -> list[dict[str, Any]]:
+        await self.ensure_initialized()
+
+        result = await self.request("tools/list", {})
+        tools = result.get("tools", []) if isinstance(result, dict) else []
+
+        self.tools_cache = tools
+        return tools
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        await self.ensure_initialized()
+
+        result = await self.request(
+            "tools/call",
+            {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+        )
+
+        if not isinstance(result, dict):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": str(result),
+                    }
+                ],
+                "isError": False,
+            }
+
+        return result
+    
+def mcp_result_to_text(result: dict[str, Any]) -> str:
+    is_error = bool(result.get("isError", False))
+    content = result.get("content", [])
+
+    parts: list[str] = []
+
+    if is_error:
+        parts.append("[MCP_TOOL_ERROR]")
+
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+
+            item_type = item.get("type")
+
+            if item_type == "text":
+                parts.append(str(item.get("text", "")))
+
+            elif item_type == "image":
+                parts.append(
+                    json.dumps(
+                        {
+                            "type": "image",
+                            "mimeType": item.get("mimeType"),
+                            "data": "[base64 image omitted]",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+
+            elif item_type == "resource":
+                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+    else:
+        parts.append(json.dumps(result, ensure_ascii=False, indent=2))
+
+    return "\n\n".join(x for x in parts if x).strip()
+
+
+def create_pending_mcp_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    decision: McpSecurityDecision,
+) -> dict[str, Any]:
+    pending_id = f"mcp_pending_{uuid.uuid4().hex[:16]}"
+    now = datetime.now().isoformat(timespec="seconds")
+
+    record = {
+        "id": pending_id,
+        "tool": tool_name,
+        "arguments": arguments,
+        "decision": decision.model_dump(),
+        "status": "pending",
+        "createdAt": now,
+        "updatedAt": now,
+        "result": "",
+        "error": "",
+    }
+
+    pending_mcp_calls[pending_id] = record
+
+    with MCP_PENDING_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record
+
+
+def update_pending_mcp_call(
+    pending_id: str,
+    status: str,
+    result: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    if pending_id not in pending_mcp_calls:
+        raise KeyError(f"Pending MCP call not found: {pending_id}")
+
+    record = pending_mcp_calls[pending_id]
+    record["status"] = status
+    record["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+    record["result"] = result
+    record["error"] = error
+
+    with MCP_PENDING_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record
+
 
 class McpManager:
     def __init__(self):
-        self.clients: dict[str, McpStdioClient] = {}
+        self.clients: dict[str, Any] = {}
         self.tool_map: dict[str, dict[str, Any]] = {}
         self.loaded = False
 
@@ -626,8 +1313,10 @@ class McpManager:
                 parsed = McpServerConfig(**conf)
                 if parsed.enabled:
                     result[name] = parsed
-            except Exception:
-                continue
+            except Exception as error:
+                log_path = API_LOG_DIR / "mcp_errors.log"
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(f"[{name}] invalid server config: {error}\n")
 
         return result
 
@@ -647,7 +1336,12 @@ class McpManager:
         configs = self.load_config()
 
         for name, config in configs.items():
-            self.clients[name] = McpStdioClient(name, config)
+            transport = (config.transport or "stdio").lower()
+
+            if transport == "streamable_http":
+                self.clients[name] = McpStreamableHttpClient(name, config)
+            else:
+                self.clients[name] = McpStdioClient(name, config)    
 
         self.loaded = True
 
@@ -675,10 +1369,12 @@ class McpManager:
 
                 input_schema = tool.get("inputSchema") or {
                     "type": "object",
-                    "properties": {}
+                    "properties": {},
                 }
 
-                description = tool.get("description") or f"MCP tool {original_name} from server {server_name}"
+                description = tool.get("description") or (
+                    f"MCP tool {original_name} from server {server_name}"
+                )
 
                 openai_tool = {
                     "type": "function",
@@ -707,56 +1403,187 @@ class McpManager:
         if api_tool_name not in self.tool_map:
             raise RuntimeError(f"Unknown MCP tool: {api_tool_name}")
 
+        decision = mcp_security.decide_tool(api_tool_name, arguments)
+
+        if not decision.allowed:
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="blocked",
+                error=decision.reason,
+            )
+
+            if decision.requires_confirmation:
+                pending = create_pending_mcp_call(
+                    tool_name=api_tool_name,
+                    arguments=arguments,
+                    decision=decision,
+                )
+
+                raise PermissionError(
+                    f"MCP tool requires confirmation and was not auto-executed.\n"
+                    f"pending_id: {pending['id']}\n"
+                    f"tool: {api_tool_name}\n"
+                    f"reason: {decision.reason}"
+                )
+
+            raise PermissionError(
+                f"MCP tool denied: {api_tool_name}. Reason: {decision.reason}"
+            )
+
         info = self.tool_map[api_tool_name]
         client: McpStdioClient = info["client"]
         original_tool_name = info["tool"]
 
-        result = await client.call_tool(original_tool_name, arguments)
-        return mcp_result_to_text(result)
+        try:
+            result = await asyncio.wait_for(
+                client.call_tool(original_tool_name, arguments),
+                timeout=mcp_security.timeout_seconds(),
+            )
+
+            text = mcp_result_to_text(result)
+            text = mcp_security.truncate_output(text)
+
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="success",
+                result_preview=text,
+            )
+
+            return text
+
+        except asyncio.TimeoutError:
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="timeout",
+                error=f"timeout after {mcp_security.timeout_seconds()} seconds",
+            )
+
+            raise TimeoutError(
+                f"MCP tool timeout after {mcp_security.timeout_seconds()} seconds: {api_tool_name}"
+            )
+
+        except Exception as error:
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="error",
+                error=f"{type(error).__name__}: {error}",
+            )
+            raise
+
+    async def execute_approved_pending_call(self, pending_id: str) -> dict[str, Any]:
+        if pending_id not in pending_mcp_calls:
+            raise KeyError(f"Pending MCP call not found: {pending_id}")
+
+        pending = pending_mcp_calls[pending_id]
+
+        if pending["status"] != "pending":
+            raise RuntimeError(
+                f"Pending MCP call is not pending. Current status: {pending['status']}"
+            )
+
+        api_tool_name = pending["tool"]
+        arguments = pending["arguments"]
+
+        if api_tool_name not in self.tool_map:
+            await self.list_tools()
+
+        if api_tool_name not in self.tool_map:
+            raise RuntimeError(f"Unknown MCP tool: {api_tool_name}")
+
+        info = self.tool_map[api_tool_name]
+        client: McpStdioClient = info["client"]
+        original_tool_name = info["tool"]
+
+        decision = McpSecurityDecision(
+            allowed=True,
+            action="approved",
+            reason=f"Manually approved pending call: {pending_id}",
+            requires_confirmation=False,
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                client.call_tool(original_tool_name, arguments),
+                timeout=mcp_security.timeout_seconds(),
+            )
+
+            text = mcp_result_to_text(result)
+            text = mcp_security.truncate_output(text)
+
+            update_pending_mcp_call(
+                pending_id=pending_id,
+                status="approved_executed",
+                result=text,
+            )
+
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="approved_success",
+                result_preview=text,
+            )
+
+            return {
+                "id": pending_id,
+                "status": "approved_executed",
+                "tool": api_tool_name,
+                "arguments": arguments,
+                "result": text,
+            }
+
+        except asyncio.TimeoutError:
+            error = f"timeout after {mcp_security.timeout_seconds()} seconds"
+
+            update_pending_mcp_call(
+                pending_id=pending_id,
+                status="approved_timeout",
+                error=error,
+            )
+
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="approved_timeout",
+                error=error,
+            )
+
+            raise TimeoutError(error)
+
+        except Exception as error:
+            error_text = f"{type(error).__name__}: {error}"
+
+            update_pending_mcp_call(
+                pending_id=pending_id,
+                status="approved_error",
+                error=error_text,
+            )
+
+            mcp_security.audit(
+                tool_name=api_tool_name,
+                arguments=arguments,
+                decision=decision,
+                status="approved_error",
+                error=error_text,
+            )
+
+            raise
 
 
-def mcp_result_to_text(result: dict[str, Any]) -> str:
-    is_error = bool(result.get("isError", False))
-    content = result.get("content", [])
-
-    parts: list[str] = []
-
-    if is_error:
-        parts.append("[MCP_TOOL_ERROR]")
-
-    if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict):
-                parts.append(str(item))
-                continue
-
-            item_type = item.get("type")
-
-            if item_type == "text":
-                parts.append(str(item.get("text", "")))
-            elif item_type == "image":
-                parts.append(
-                    json.dumps(
-                        {
-                            "type": "image",
-                            "mimeType": item.get("mimeType"),
-                            "data": "[base64 image omitted]",
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-            elif item_type == "resource":
-                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
-            else:
-                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
-    else:
-        parts.append(json.dumps(result, ensure_ascii=False, indent=2))
-
-    return "\n\n".join(x for x in parts if x).strip()
-
-
+mcp_security = McpSecurityManager()
 mcp_manager = McpManager()
 
+load_pending_mcp_calls_from_log()
+compact_pending_mcp_log()
 
 def make_chat_response(
     req: ChatCompletionRequest,
@@ -868,7 +1695,7 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
     raw_output = ""
     last_prompt = ""
 
-    for loop_index in range(MAX_TOOL_LOOPS):
+    for _loop_index in range(MAX_TOOL_LOOPS):
         prompt_text = build_api_prompt(
             messages=messages,
             tools=all_tools,
@@ -956,7 +1783,10 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
 app = FastAPI(
     title="DevTools Radar Local API",
     version=SERVER_VERSION,
-    description="OpenAI-compatible local API backed by ChatGPT Web UI automation with MCP tool support.",
+    description=(
+        "OpenAI-compatible local API backed by ChatGPT Web UI automation "
+        "with MCP tool support, security layer, and approval workflow."
+    ),
 )
 
 
@@ -969,6 +1799,7 @@ async def root() -> dict[str, Any]:
         "openai_compatible_base_url": "http://127.0.0.1:8788/v1",
         "model": DEFAULT_MODEL,
         "mcp_config": str(MCP_CONFIG_PATH),
+        "mcp_security": str(MCP_SECURITY_PATH),
     }
 
 
@@ -981,6 +1812,11 @@ async def health() -> dict[str, Any]:
         "base_dir": str(BASE_DIR),
         "model": DEFAULT_MODEL,
         "mcp_config_exists": MCP_CONFIG_PATH.exists(),
+        "mcp_security_exists": MCP_SECURITY_PATH.exists(),
+        "mcp_security_enabled": mcp_security.enabled(),
+        "pending_mcp_calls": len(pending_mcp_calls),
+        "pending_mcp_calls_loaded": len(pending_mcp_calls),
+        "mcp_supports_streamable_http": True,
     }
 
 
@@ -997,6 +1833,79 @@ async def list_models(request: Request) -> dict[str, Any]:
         ],
     }
 
+@app.get("/v1/mcp/config")
+async def get_mcp_config(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    if not MCP_CONFIG_PATH.exists():
+        return {
+            "config_path": str(MCP_CONFIG_PATH),
+            "config": {
+                "servers": {}
+            }
+        }
+
+    try:
+        config = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read mcp_servers.json: {type(error).__name__}: {error}",
+        )
+
+    return {
+        "config_path": str(MCP_CONFIG_PATH),
+        "config": config,
+    }
+
+
+@app.put("/v1/mcp/config")
+async def save_mcp_config(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    config = payload.get("config", payload)
+
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="config must be an object")
+
+    if "servers" not in config or not isinstance(config["servers"], dict):
+        raise HTTPException(status_code=400, detail="config.servers must be an object")
+
+    # Validate before writing.
+    for name, server_config in config["servers"].items():
+        if not isinstance(server_config, dict):
+            raise HTTPException(status_code=400, detail=f"server config must be object: {name}")
+
+        try:
+            McpServerConfig(**server_config)
+        except Exception as error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid server config {name}: {type(error).__name__}: {error}",
+            )
+
+    backup_path = MCP_CONFIG_PATH.with_suffix(".json.bak")
+
+    if MCP_CONFIG_PATH.exists():
+        backup_path.write_text(
+            MCP_CONFIG_PATH.read_text(encoding="utf-8", errors="replace"),
+            encoding="utf-8",
+        )
+
+    MCP_CONFIG_PATH.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    await mcp_manager.reload()
+
+    return {
+        "status": "ok",
+        "message": "mcp_servers.json saved and MCP servers reloaded",
+        "config_path": str(MCP_CONFIG_PATH),
+        "backup_path": str(backup_path),
+        "config": config,
+    }
 
 @app.get("/v1/mcp/servers")
 async def list_mcp_servers(request: Request) -> dict[str, Any]:
@@ -1008,13 +1917,22 @@ async def list_mcp_servers(request: Request) -> dict[str, Any]:
         "servers": [
             {
                 "name": name,
-                "running": client.process is not None and client.process.returncode is None,
+                "transport": client.config.transport,
+                "running": (
+                    True
+                    if client.config.transport == "streamable_http" and client.http is not None
+                    else client.process is not None and client.process.returncode is None
+                    if hasattr(client, "process")
+                    else False
+                ),
                 "initialized": client.initialized,
+                "url": getattr(client.config, "url", ""),
+                "command": getattr(client.config, "command", ""),
+                "args": getattr(client.config, "args", []),
             }
             for name, client in mcp_manager.clients.items()
         ],
     }
-
 
 @app.get("/v1/mcp/tools")
 async def list_mcp_tools(request: Request) -> dict[str, Any]:
@@ -1038,6 +1956,130 @@ async def reload_mcp(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "message": "MCP servers reloaded",
+    }
+
+
+@app.get("/v1/mcp/security")
+async def get_mcp_security(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    return {
+        "config_path": str(MCP_SECURITY_PATH),
+        "config_exists": MCP_SECURITY_PATH.exists(),
+        "security": mcp_security.config,
+    }
+
+
+@app.post("/v1/mcp/security/reload")
+async def reload_mcp_security(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    mcp_security.reload()
+
+    return {
+        "status": "ok",
+        "message": "MCP security config reloaded",
+        "config_path": str(MCP_SECURITY_PATH),
+    }
+
+
+@app.get("/v1/mcp/audit")
+async def get_mcp_audit(request: Request, limit: int = 50) -> dict[str, Any]:
+    await verify_auth(request)
+
+    if not MCP_AUDIT_LOG.exists():
+        return {
+            "object": "list",
+            "data": [],
+            "count": 0,
+        }
+
+    lines = MCP_AUDIT_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    selected = lines[-max(1, min(limit, 500)):]
+
+    records = []
+
+    for line in selected:
+        try:
+            records.append(json.loads(line))
+        except Exception:
+            records.append({"raw": line})
+
+    return {
+        "object": "list",
+        "data": records,
+        "count": len(records),
+    }
+
+
+@app.get("/v1/mcp/approvals")
+async def list_mcp_approvals(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    records = list(pending_mcp_calls.values())
+    records.sort(key=lambda x: x.get("createdAt", ""), reverse=True)
+
+    return {
+        "object": "list",
+        "data": records,
+        "count": len(records),
+    }
+
+
+@app.post("/v1/mcp/approvals/{pending_id}/approve")
+async def approve_mcp_call(pending_id: str, request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    async with runner_lock:
+        try:
+            result = await mcp_manager.execute_approved_pending_call(pending_id)
+            return {
+                "status": "ok",
+                "approval": result,
+            }
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error))
+        except Exception as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"{type(error).__name__}: {error}",
+            )
+
+
+@app.post("/v1/mcp/approvals/{pending_id}/deny")
+async def deny_mcp_call(pending_id: str, request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    if pending_id not in pending_mcp_calls:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Pending MCP call not found: {pending_id}",
+        )
+
+    record = update_pending_mcp_call(
+        pending_id=pending_id,
+        status="denied",
+        error="Denied by user",
+    )
+
+    decision = McpSecurityDecision(
+        allowed=False,
+        action="denied_by_user",
+        reason=f"User denied pending call: {pending_id}",
+        requires_confirmation=False,
+    )
+
+    mcp_security.audit(
+        tool_name=record["tool"],
+        arguments=record["arguments"],
+        decision=decision,
+        status="denied_by_user",
+        error="Denied by user",
+    )
+
+    return {
+        "status": "ok",
+        "approval": record,
     }
 
 
