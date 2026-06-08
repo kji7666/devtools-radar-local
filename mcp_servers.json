@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "filesystem": {
+      "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:\\side_project\\auto_gpt"
+      ],
+      "env": {}
+    }
+  }
+}
