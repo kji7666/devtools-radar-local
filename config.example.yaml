@@ -1,0 +1,15 @@
+# config.example.yaml
+chatgpt_url: "https://chatgpt.com/"
+browser:
+  channel: "msedge"
+  debug_port: 9222
+  user_data_dir: "edge_debug_profile"
+
+runner:
+  wait_seconds: 300
+  output_file: "output.txt"
+  output_format: "markdown"
+
+task:
+  outputs_dir: "outputs"
+  runs_dir: "runs"

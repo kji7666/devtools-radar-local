@@ -1,0 +1,39 @@
+{
+  "servers": {
+    "filesystem": {
+      "enabled": true,
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:\\side_project\\auto_gpt"
+      ],
+      "env": {},
+
+      "risk_level": "low",
+      "trust": "trusted",
+      "network": "deny",
+      "filesystem": "scoped",
+      "shell": "deny",
+      "auto_approve": false,
+      "notes": "Filesystem MCP scoped to project root. Change path after cloning."
+    },
+
+    "remote_example": {
+      "enabled": false,
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": {},
+      "timeout_seconds": 30,
+
+      "risk_level": "medium",
+      "trust": "unreviewed",
+      "network": "unknown",
+      "filesystem": "unknown",
+      "shell": "deny",
+      "auto_approve": false,
+      "notes": "Example Streamable HTTP MCP server."
+    }
+  }
+}

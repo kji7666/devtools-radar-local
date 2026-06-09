@@ -9,26 +9,57 @@
     "D:\\side_project\\auto_gpt"
   ],
 
+  "argument_guards": {
+    "blocked_path_patterns": [
+      "**/.env",
+      "**/.git/**",
+      "**/Cookies",
+      "**/Local State",
+      "**/edge_debug_profile/**",
+      "**/browser_profile/**",
+      "**/auth_state.json",
+      "**/id_rsa",
+      "**/id_ed25519",
+      "**/*.pem",
+      "**/*.key"
+    ],
+    "blocked_command_patterns": [
+      "powershell*",
+      "pwsh*",
+      "cmd*",
+      "bash*",
+      "sh*",
+      "curl*",
+      "wget*",
+      "iwr*",
+      "irm*",
+      "rm *",
+      "del *",
+      "rmdir *",
+      "format *",
+      "git push*",
+      "git config*",
+      "npm publish*"
+    ],
+    "blocked_env_keys": [
+      "*TOKEN*",
+      "*SECRET*",
+      "*KEY*",
+      "*PASSWORD*",
+      "*COOKIE*"
+    ]
+  },
+
   "tool_policies": [
-    {
-      "pattern": "filesystem__read_file",
-      "action": "allow",
-      "reason": "Read-only file access inside allowed roots"
-    },
     {
       "pattern": "filesystem__read_text_file",
       "action": "allow",
       "reason": "Read-only text file access inside allowed roots"
     },
     {
-      "pattern": "filesystem__read_media_file",
+      "pattern": "filesystem__read_file",
       "action": "allow",
-      "reason": "Read-only media file access inside allowed roots"
-    },
-    {
-      "pattern": "filesystem__read_multiple_files",
-      "action": "allow",
-      "reason": "Read-only multiple file access inside allowed roots"
+      "reason": "Read-only file access inside allowed roots"
     },
     {
       "pattern": "filesystem__list_directory",
@@ -53,9 +84,8 @@
     {
       "pattern": "filesystem__get_file_info",
       "action": "allow",
-      "reason": "Read-only file metadata access"
+      "reason": "Read-only metadata access"
     },
-
     {
       "pattern": "filesystem__write_file",
       "action": "confirm",
@@ -69,29 +99,27 @@
     {
       "pattern": "filesystem__create_directory",
       "action": "confirm",
-      "reason": "Creating folders requires explicit confirmation"
+      "reason": "Creating directory requires explicit confirmation"
     },
     {
       "pattern": "filesystem__move_file",
       "action": "confirm",
       "reason": "Moving files requires explicit confirmation"
     },
-
     {
       "pattern": "filesystem__delete_file",
       "action": "deny",
-      "reason": "Deleting files is not allowed automatically"
+      "reason": "Deleting files is denied"
     },
     {
       "pattern": "filesystem__remove_directory",
       "action": "deny",
-      "reason": "Deleting directories is not allowed automatically"
+      "reason": "Deleting directories is denied"
     },
-
     {
       "pattern": "filesystem__*",
       "action": "deny",
-      "reason": "Unlisted filesystem tool is denied by default"
+      "reason": "Unlisted filesystem tool denied by default"
     }
   ]
 }

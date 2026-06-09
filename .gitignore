@@ -44,3 +44,69 @@ config.local.yaml
 .idea/
 .DS_Store
 Thumbs.db
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Electron
+app/node_modules/
+app/dist/
+app/dist-electron/
+app/release/
+app/out/
+app/.vite/
+
+# Runtime browser profiles / auth
+edge_debug_profile/
+browser_profile/
+auth_state.json
+*.cookies
+*Cookies*
+*Local State*
+
+# Runtime data
+logs/
+outputs/
+runs/
+screenshots/
+api_tmp/
+tmp/
+temp/
+
+# Local input/output
+input.txt
+output.txt
+
+# Local configs with paths/secrets
+config.yaml
+mcp_servers.json
+mcp_security.json
+mcp_tool_snapshots.json
+
+# Secrets
+.env
+.env.*
+*.local
+*.secret
+secrets.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build artifacts
+*.exe
+*.msi
+*.zip
+*.7z
+*.log
