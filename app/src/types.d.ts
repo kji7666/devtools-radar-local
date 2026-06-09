@@ -116,6 +116,12 @@ declare global {
       saveMcpConfig: (config: any) => Promise<any>
       listMcpServers: () => Promise<any>
       reloadMcpServers: () => Promise<any>
+      saveMcpSecurity: (security: any) => Promise<any>
+      reloadMcpSecurity: () => Promise<any>
+      getMcpTools: () => Promise<any>
+      readLogs: () => Promise<string>
+      listMcpToolSnapshots: () => Promise<{ object: string; data: McpToolSnapshot[]; count: number }>
+      approveMcpToolSnapshot: (toolName: string) => Promise<any>
     }
   }
 }
@@ -169,6 +175,40 @@ declare global {
       denyMcpCall: (pendingId: string) => Promise<any>
     }
   }
+}
+
+export type McpToolSnapshot = {
+  api_tool_name: string
+  server: string
+  name: string
+  description: string
+  description_hash: string
+  schema_hash: string
+  schema: Record<string, any>
+  status: string
+  first_seen: string
+  last_seen: string
+  approved: boolean
+  approved_at: string
+  changes: any[]
+}
+
+export type McpApproval = {
+  id: string
+  tool: string
+  arguments: Record<string, any>
+  decision: {
+    allowed: boolean
+    action: string
+    reason: string
+    requires_confirmation: boolean
+  }
+  review?: any
+  status: string
+  createdAt: string
+  updatedAt: string
+  result: string
+  error: string
 }
 
 export {}

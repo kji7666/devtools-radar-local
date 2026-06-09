@@ -7,7 +7,8 @@ import type {
   SystemStatus,
   TaskMeta,
   McpApproval,
-  McpAuditRecord
+  McpAuditRecord,
+  McpToolSnapshot
 } from './types'
 
 type Page = 'dashboard' | 'chat' | 'tasks' | 'outputs' | 'runs' | 'mcp' | 'logs' | 'settings'
@@ -48,6 +49,15 @@ const mcpConfigText = ref('')
 const mcpServers = ref<any[]>([])
 const mcpConfigBusy = ref(false)
 
+const mcpSecurityText = ref('')
+const mcpTools = ref<any[]>([])
+const mcpSecurityBusy = ref(false)
+const selectedMcpToolName = ref('')
+
+const mcpToolSnapshots = ref<McpToolSnapshot[]>([])
+const selectedMcpSnapshot = ref<McpToolSnapshot | null>(null)
+const mcpSnapshotBusy = ref(false)
+
 function bridge() {
   if (!window.autoGpt) {
     throw new Error('Electron bridge window.autoGpt is not available')
@@ -73,7 +83,7 @@ const pageTitle = computed(() => {
     tasks: 'Tasks',
     outputs: 'Outputs',
     runs: 'Runs',
-    mcp: 'MCP Approvals',
+    mcp: 'MCP',
     logs: 'Logs',
     settings: 'Settings'
   }
@@ -83,6 +93,13 @@ const pageTitle = computed(() => {
 
 const pendingApprovalCount = computed(() => {
   return mcpApprovals.value.filter((item) => item.status === 'pending').length
+})
+
+const mcpToolNames = computed(() => {
+  return mcpTools.value
+    .map((item) => item?.function?.name)
+    .filter(Boolean)
+    .sort()
 })
 
 function formatTime(value?: string) {
@@ -113,15 +130,15 @@ function shortText(text: string, max = 600) {
 function statusClass(value: string) {
   const s = String(value || '').toLowerCase()
 
-  if (s.includes('success') || s.includes('ok') || s.includes('approved_executed')) {
+  if (s.includes('success') || s.includes('ok') || s.includes('approved_executed') || s === 'allow') {
     return 'ok'
   }
 
-  if (s.includes('pending') || s.includes('timeout') || s.includes('confirm')) {
+  if (s.includes('pending') || s.includes('timeout') || s.includes('confirm') || s === 'default') {
     return 'warn'
   }
 
-  if (s.includes('error') || s.includes('failed') || s.includes('denied') || s.includes('blocked')) {
+  if (s.includes('error') || s.includes('failed') || s.includes('denied') || s.includes('blocked') || s === 'deny') {
     return 'bad'
   }
 
@@ -365,13 +382,15 @@ async function refreshMcpPage() {
   try {
     mcpBusy.value = true
 
-    const [health, security, approvals, audit, configResult, serverResult] = await Promise.all([
+    const [health, security, approvals, audit, configResult, serverResult, toolsResult] = await Promise.all([
       bridge().apiHealth(),
       bridge().getMcpSecurity(),
       bridge().listMcpApprovals(),
       bridge().getMcpAudit(100),
       bridge().getMcpConfig(),
-      bridge().listMcpServers()
+      bridge().listMcpServers(),
+      bridge().getMcpTools(),
+      bridge().listMcpToolSnapshots()
     ])
 
     mcpHealth.value = health
@@ -380,6 +399,8 @@ async function refreshMcpPage() {
     mcpAudit.value = audit?.data || []
     mcpConfigText.value = formatJson(configResult?.config || { servers: {} })
     mcpServers.value = serverResult?.servers || []
+    mcpSecurityText.value = formatJson(security?.security || {})
+    mcpTools.value = toolsResult?.data || []
 
     if (selectedMcpApproval.value) {
       const updated = mcpApprovals.value.find((item) => item.id === selectedMcpApproval.value?.id)
@@ -392,21 +413,37 @@ async function refreshMcpPage() {
   }
 }
 
-async function refreshMcpConfig() {
+function snapshotStatusClass(status: string) {
+  const s = String(status || '').toLowerCase()
+
+  if (s === 'approved') return 'ok'
+  if (s === 'new' || s === 'changed') return 'warn'
+  if (s === 'missing') return 'bad'
+
+  return ''
+}
+
+function getSnapshotForTool(toolName: string) {
+  return mcpToolSnapshots.value.find((item) => item.api_tool_name === toolName) || null
+}
+
+async function approveSelectedSnapshot() {
+  if (!selectedMcpSnapshot.value) {
+    showToast('請先選擇一個 tool snapshot')
+    return
+  }
+
   try {
-    mcpConfigBusy.value = true
+    mcpSnapshotBusy.value = true
 
-    const [configResult, serverResult] = await Promise.all([
-      bridge().getMcpConfig(),
-      bridge().listMcpServers()
-    ])
+    await bridge().approveMcpToolSnapshot(selectedMcpSnapshot.value.api_tool_name)
+    await refreshMcpPage()
 
-    mcpConfigText.value = formatJson(configResult?.config || { servers: {} })
-    mcpServers.value = serverResult?.servers || []
+    showToast(`已核准 tool snapshot：${selectedMcpSnapshot.value.api_tool_name}`)
   } catch (error: any) {
-    showToast(`MCP config 讀取失敗：${error?.message ?? error}`)
+    showToast(`核准 snapshot 失敗：${error?.message ?? error}`)
   } finally {
-    mcpConfigBusy.value = false
+    mcpSnapshotBusy.value = false
   }
 }
 
@@ -483,6 +520,168 @@ function insertHttpMcpTemplate() {
     headers: {},
     timeout_seconds: 30
   })
+}
+
+function getSecurityConfigObject() {
+  try {
+    const parsed = JSON.parse(mcpSecurityText.value || '{}')
+    if (!parsed.tool_policies) parsed.tool_policies = []
+    if (!parsed.allowed_roots) parsed.allowed_roots = []
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function findPolicyForTool(toolName: string) {
+  const config = getSecurityConfigObject()
+  if (!config) return null
+
+  return config.tool_policies.find((policy: any) => policy.pattern === toolName) || null
+}
+
+function getPolicyAction(toolName: string) {
+  const policy = findPolicyForTool(toolName)
+  return policy?.action || 'default'
+}
+
+function setToolPolicy(toolName: string, action: 'allow' | 'confirm' | 'deny') {
+  const config = getSecurityConfigObject()
+
+  if (!config) {
+    showToast('mcp_security.json 不是合法 JSON')
+    return
+  }
+
+  if (!Array.isArray(config.tool_policies)) {
+    config.tool_policies = []
+  }
+
+  let policy = config.tool_policies.find((item: any) => item.pattern === toolName)
+
+  if (!policy) {
+    policy = {
+      pattern: toolName,
+      action,
+      reason: `${action} by MCP Security Policy UI`
+    }
+
+    config.tool_policies.unshift(policy)
+  } else {
+    policy.action = action
+    policy.reason = policy.reason || `${action} by MCP Security Policy UI`
+  }
+
+  mcpSecurityText.value = formatJson(config)
+  selectedMcpToolName.value = toolName
+}
+
+function removeToolPolicy(toolName: string) {
+  const config = getSecurityConfigObject()
+
+  if (!config) {
+    showToast('mcp_security.json 不是合法 JSON')
+    return
+  }
+
+  config.tool_policies = (config.tool_policies || []).filter((item: any) => item.pattern !== toolName)
+  mcpSecurityText.value = formatJson(config)
+  selectedMcpToolName.value = toolName
+}
+
+function generateMissingMcpPolicies() {
+  const config = getSecurityConfigObject()
+
+  if (!config) {
+    showToast('mcp_security.json 不是合法 JSON')
+    return
+  }
+
+  if (!Array.isArray(config.tool_policies)) {
+    config.tool_policies = []
+  }
+
+  const existing = new Set(config.tool_policies.map((item: any) => item.pattern))
+  let added = 0
+
+  for (const toolName of mcpToolNames.value) {
+    if (existing.has(toolName)) continue
+
+    let action: 'allow' | 'confirm' | 'deny' = 'deny'
+    let reason = 'Generated by MCP Security Policy UI'
+
+    const lower = toolName.toLowerCase()
+
+    if (
+      lower.includes('read') ||
+      lower.includes('list') ||
+      lower.includes('search') ||
+      lower.includes('get_file_info') ||
+      lower.includes('directory_tree')
+    ) {
+      action = 'allow'
+      reason = 'Auto-generated read-only policy'
+    } else if (
+      lower.includes('write') ||
+      lower.includes('edit') ||
+      lower.includes('create') ||
+      lower.includes('move') ||
+      lower.includes('update')
+    ) {
+      action = 'confirm'
+      reason = 'Auto-generated write/change policy requiring confirmation'
+    } else if (
+      lower.includes('delete') ||
+      lower.includes('remove') ||
+      lower.includes('rm')
+    ) {
+      action = 'deny'
+      reason = 'Auto-generated destructive policy'
+    }
+
+    config.tool_policies.push({
+      pattern: toolName,
+      action,
+      reason
+    })
+
+    added += 1
+  }
+
+  mcpSecurityText.value = formatJson(config)
+  showToast(`已新增 ${added} 筆缺少的 policy`)
+}
+
+async function saveMcpSecurity() {
+  try {
+    mcpSecurityBusy.value = true
+
+    const parsed = JSON.parse(mcpSecurityText.value)
+
+    await bridge().saveMcpSecurity(parsed)
+    await refreshMcpPage()
+
+    showToast('MCP security policy saved and reloaded')
+  } catch (error: any) {
+    showToast(`MCP security 儲存失敗：${error?.message ?? error}`)
+  } finally {
+    mcpSecurityBusy.value = false
+  }
+}
+
+async function reloadMcpSecurity() {
+  try {
+    mcpSecurityBusy.value = true
+
+    await bridge().reloadMcpSecurity()
+    await refreshMcpPage()
+
+    showToast('MCP security reloaded')
+  } catch (error: any) {
+    showToast(`MCP security reload 失敗：${error?.message ?? error}`)
+  } finally {
+    mcpSecurityBusy.value = false
+  }
 }
 
 function selectMcpApproval(item: McpApproval) {
@@ -608,40 +807,19 @@ onMounted(async () => {
       </div>
 
       <nav class="nav">
-        <button :class="{ active: page === 'dashboard' }" @click="switchPage('dashboard')">
-          Dashboard
-        </button>
-
-        <button :class="{ active: page === 'chat' }" @click="switchPage('chat')">
-          Chat
-        </button>
-
-        <button :class="{ active: page === 'tasks' }" @click="switchPage('tasks')">
-          Tasks
-        </button>
-
-        <button :class="{ active: page === 'outputs' }" @click="switchPage('outputs')">
-          Outputs
-        </button>
-
-        <button :class="{ active: page === 'runs' }" @click="switchPage('runs')">
-          Runs
-        </button>
+        <button :class="{ active: page === 'dashboard' }" @click="switchPage('dashboard')">Dashboard</button>
+        <button :class="{ active: page === 'chat' }" @click="switchPage('chat')">Chat</button>
+        <button :class="{ active: page === 'tasks' }" @click="switchPage('tasks')">Tasks</button>
+        <button :class="{ active: page === 'outputs' }" @click="switchPage('outputs')">Outputs</button>
+        <button :class="{ active: page === 'runs' }" @click="switchPage('runs')">Runs</button>
 
         <button :class="{ active: page === 'mcp' }" @click="switchPage('mcp')">
           <span>MCP</span>
-          <span v-if="pendingApprovalCount > 0" class="nav-badge">
-            {{ pendingApprovalCount }}
-          </span>
+          <span v-if="pendingApprovalCount > 0" class="nav-badge">{{ pendingApprovalCount }}</span>
         </button>
 
-        <button :class="{ active: page === 'logs' }" @click="switchPage('logs')">
-          Logs
-        </button>
-
-        <button :class="{ active: page === 'settings' }" @click="switchPage('settings')">
-          Settings
-        </button>
+        <button :class="{ active: page === 'logs' }" @click="switchPage('logs')">Logs</button>
+        <button :class="{ active: page === 'settings' }" @click="switchPage('settings')">Settings</button>
       </nav>
 
       <div class="sidebar-footer">
@@ -908,21 +1086,10 @@ onMounted(async () => {
             </div>
 
             <div class="inline-actions">
-              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertStdioMcpTemplate">
-                Add stdio
-              </button>
-
-              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertHttpMcpTemplate">
-                Add HTTP
-              </button>
-
-              <button class="small-btn" :disabled="mcpConfigBusy" @click="reloadMcpServers">
-                Reload
-              </button>
-
-              <button class="primary-btn" :disabled="mcpConfigBusy" @click="saveMcpConfig">
-                Save
-              </button>
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertStdioMcpTemplate">Add stdio</button>
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="insertHttpMcpTemplate">Add HTTP</button>
+              <button class="small-btn" :disabled="mcpConfigBusy" @click="reloadMcpServers">Reload</button>
+              <button class="primary-btn" :disabled="mcpConfigBusy" @click="saveMcpConfig">Save</button>
             </div>
           </div>
 
@@ -957,13 +1124,162 @@ onMounted(async () => {
           />
         </div>
 
+        <div class="panel mcp-security-panel">
+          <div class="panel-header">
+            <div>
+              <h3>MCP Security Policy</h3>
+              <p class="muted">Manage mcp_security.json. Set each tool to allow / confirm / deny.</p>
+            </div>
+
+            <div class="inline-actions">
+              <button class="small-btn" :disabled="mcpSecurityBusy" @click="generateMissingMcpPolicies">
+                Generate Missing
+              </button>
+
+              <button class="small-btn" :disabled="mcpSecurityBusy" @click="reloadMcpSecurity">
+                Reload
+              </button>
+
+              <button class="primary-btn" :disabled="mcpSecurityBusy" @click="saveMcpSecurity">
+                Save
+              </button>
+            </div>
+          </div>
+
+          <div class="mcp-security-summary">
+            <div class="kv">
+              <span>Enabled</span>
+              <strong :class="mcpSecurity?.security?.enabled ? 'ok' : 'warn'">
+                {{ mcpSecurity?.security?.enabled ? 'true' : 'false' }}
+              </strong>
+            </div>
+
+            <div class="kv">
+              <span>Default Action</span>
+              <strong>{{ mcpSecurity?.security?.default_action || 'unknown' }}</strong>
+            </div>
+
+            <div class="kv">
+              <span>Tool Policies</span>
+              <strong>{{ mcpSecurity?.security?.tool_policies?.length || 0 }}</strong>
+            </div>
+
+            <div class="kv">
+              <span>Detected Tools</span>
+              <strong>{{ mcpToolNames.length }}</strong>
+            </div>
+          </div>
+
+          <div class="mcp-policy-grid">
+            <div class="mcp-policy-list">
+              <div
+                v-for="toolName in mcpToolNames"
+                :key="toolName"
+                class="mcp-policy-row"
+                :class="{ selected: selectedMcpToolName === toolName }"
+                @click="selectedMcpToolName = toolName"
+              >
+                <div>
+                  <strong>{{ toolName }}</strong>
+                  <span :class="statusClass(getPolicyAction(toolName))">
+                    {{ getPolicyAction(toolName) }}
+                  </span>
+                </div>
+
+                <div class="inline-actions">
+                  <button class="small-btn" @click.stop="setToolPolicy(toolName, 'allow')">Allow</button>
+                  <button class="small-btn" @click.stop="setToolPolicy(toolName, 'confirm')">Confirm</button>
+                  <button class="danger-btn" @click.stop="setToolPolicy(toolName, 'deny')">Deny</button>
+                  <button class="small-btn" @click.stop="removeToolPolicy(toolName)">Default</button>
+                </div>
+              </div>
+
+              <p v-if="mcpToolNames.length === 0" class="muted">
+                No MCP tools detected. Check MCP Servers or click Reload.
+              </p>
+            </div>
+
+            <textarea
+              v-model="mcpSecurityText"
+              class="config-textarea mcp-security-editor"
+              spellcheck="false"
+            />
+          </div>
+        </div>
+
+        <div class="panel mcp-snapshot-panel">
+          <div class="panel-header">
+            <div>
+              <h3>MCP Tool Snapshots</h3>
+              <p class="muted">
+                Detect new or changed tool descriptors. Approve snapshots after review.
+              </p>
+            </div>
+
+            <div class="inline-actions">
+              <button class="primary-btn" :disabled="mcpSnapshotBusy || !selectedMcpSnapshot" @click="approveSelectedSnapshot">
+                Approve Snapshot
+              </button>
+            </div>
+          </div>
+
+          <div class="mcp-snapshot-grid">
+            <div class="mcp-snapshot-list">
+              <button
+                v-for="item in mcpToolSnapshots"
+                :key="item.api_tool_name"
+                class="mcp-snapshot-row"
+                :class="{ selected: selectedMcpSnapshot?.api_tool_name === item.api_tool_name }"
+                @click="selectedMcpSnapshot = item"
+              >
+                <strong>{{ item.api_tool_name }}</strong>
+                <span :class="snapshotStatusClass(item.status)">
+                  {{ item.status }}
+                </span>
+                <small>{{ item.server }} · {{ item.name }}</small>
+              </button>
+
+              <p v-if="mcpToolSnapshots.length === 0" class="muted">
+                No snapshots yet. Refresh MCP tools first.
+              </p>
+            </div>
+
+            <div class="mcp-snapshot-detail" v-if="selectedMcpSnapshot">
+              <div class="kv">
+                <span>Status</span>
+                <strong :class="snapshotStatusClass(selectedMcpSnapshot.status)">
+                  {{ selectedMcpSnapshot.status }}
+                </strong>
+              </div>
+
+              <div class="kv">
+                <span>Approved</span>
+                <strong :class="selectedMcpSnapshot.approved ? 'ok' : 'warn'">
+                  {{ selectedMcpSnapshot.approved ? 'true' : 'false' }}
+                </strong>
+              </div>
+
+              <h3>Description</h3>
+              <pre class="content-view small-view">{{ selectedMcpSnapshot.description }}</pre>
+
+              <h3>Schema</h3>
+              <pre class="content-view small-view">{{ formatJson(selectedMcpSnapshot.schema) }}</pre>
+
+              <h3>Changes</h3>
+              <pre class="content-view small-view">{{ formatJson(selectedMcpSnapshot.changes || []) }}</pre>
+            </div>
+
+            <div class="panel empty-state" v-else>
+              <h3>Select a tool snapshot</h3>
+            </div>
+          </div>
+        </div>
+
         <div class="mcp-grid">
           <div class="panel list-panel">
             <div class="panel-header">
               <h3>MCP Approvals</h3>
-              <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">
-                Refresh
-              </button>
+              <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">Refresh</button>
             </div>
 
             <div class="mcp-status-box">
@@ -1065,6 +1381,43 @@ onMounted(async () => {
             <h3>Reason</h3>
             <pre class="content-view small-view">{{ selectedMcpApproval.decision?.reason }}</pre>
 
+            <h3>Review</h3>
+            <div class="mcp-review-grid" v-if="selectedMcpApproval.review">
+              <div class="kv">
+                <span>Server</span>
+                <strong>{{ selectedMcpApproval.review.server }}</strong>
+              </div>
+
+              <div class="kv">
+                <span>Risk</span>
+                <strong :class="statusClass(selectedMcpApproval.review.risk?.risk)">
+                  {{ selectedMcpApproval.review.risk?.risk }}
+                </strong>
+              </div>
+
+              <div class="kv">
+                <span>Snapshot</span>
+                <strong :class="snapshotStatusClass(selectedMcpApproval.review.tool_snapshot?.status)">
+                  {{ selectedMcpApproval.review.tool_snapshot?.status || 'unknown' }}
+                </strong>
+              </div>
+
+              <div class="kv">
+                <span>Policy</span>
+                <strong>{{ selectedMcpApproval.review.matched_policy?.action || 'none' }}</strong>
+              </div>
+            </div>
+
+            <h3 v-if="selectedMcpApproval.review">Server Profile</h3>
+            <pre v-if="selectedMcpApproval.review" class="content-view small-view">
+            {{ formatJson(selectedMcpApproval.review.server_profile) }}
+            </pre>
+
+            <h3 v-if="selectedMcpApproval.review">Affected Paths</h3>
+            <pre v-if="selectedMcpApproval.review" class="content-view small-view">
+            {{ formatJson(selectedMcpApproval.review.risk?.affected_paths || []) }}
+            </pre>
+
             <h3>Arguments</h3>
             <pre class="content-view small-view">{{ formatJson(selectedMcpApproval.arguments) }}</pre>
 
@@ -1086,9 +1439,7 @@ onMounted(async () => {
         <div class="panel mcp-audit-panel">
           <div class="panel-header">
             <h3>MCP Audit</h3>
-            <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">
-              Refresh
-            </button>
+            <button class="small-btn" :disabled="mcpBusy" @click="refreshMcpPage">Refresh</button>
           </div>
 
           <div class="audit-list">

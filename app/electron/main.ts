@@ -532,16 +532,36 @@ ipcMain.handle('runs:read', async (_event, filename: string) => {
   return await readJsonFile(path.join(RUNS_DIR, filename))
 })
 
-ipcMain.handle('logs:read', async (_event, name: string) => {
-  const allowed = new Set(['runner.log', 'bat.log'])
-  if (!allowed.has(name)) throw new Error('Invalid log file')
+ipcMain.handle('logs:read', async () => {
+  const rootDir = path.resolve(app.getAppPath(), '..')
+  const logsDir = path.join(rootDir, 'logs')
 
-  try {
-    const text = await fs.readFile(path.join(LOGS_DIR, name), 'utf-8')
-    return text.split(/\r?\n/).slice(-500).join('\n')
-  } catch {
-    return ''
+  const logFiles = [
+    'mcp_audit.log',
+    'mcp_pending.log',
+    'mcp_errors.log',
+    'mcp_stderr.log',
+    'mcp_security.log',
+    'mcp_stdout_invalid.log'
+  ]
+
+  const parts: string[] = []
+
+  for (const file of logFiles) {
+    const filePath = path.join(logsDir, file)
+
+    try {
+      const text = await fs.readFile(filePath, 'utf-8')
+      const lines = text.split(/\r?\n/)
+      const tail = lines.slice(-120).join('\n')
+
+      parts.push(`===== ${file} =====\n${tail}`)
+    } catch {
+      parts.push(`===== ${file} =====\n<no log file>`)
+    }
   }
+
+  return parts.join('\n\n')
 })
 
 ipcMain.handle('config:read', async () => {
@@ -650,6 +670,33 @@ ipcMain.handle('mcp:servers:list', async () => {
 
 ipcMain.handle('mcp:servers:reload', async () => {
   return await apiJson('/v1/mcp/reload', {
+    method: 'POST'
+  })
+})
+
+ipcMain.handle('mcp:security:save', async (_event, security: any) => {
+  return await apiJson('/v1/mcp/security', {
+    method: 'PUT',
+    body: JSON.stringify({ security })
+  })
+})
+
+ipcMain.handle('mcp:security:reload', async () => {
+  return await apiJson('/v1/mcp/security/reload', {
+    method: 'POST'
+  })
+})
+
+ipcMain.handle('mcp:tools:list', async () => {
+  return await apiJson('/v1/mcp/tools')
+})
+
+ipcMain.handle('mcp:tool-snapshots:list', async () => {
+  return await apiJson('/v1/mcp/tool-snapshots')
+})
+
+ipcMain.handle('mcp:tool-snapshots:approve', async (_event, toolName: string) => {
+  return await apiJson(`/v1/mcp/tool-snapshots/${encodeURIComponent(toolName)}/approve`, {
     method: 'POST'
   })
 })

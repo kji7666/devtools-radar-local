@@ -50,4 +50,11 @@ contextBridge.exposeInMainWorld('autoGpt', {
   saveMcpConfig: (config: any) => ipcRenderer.invoke('mcp:config:save', config),
   listMcpServers: () => ipcRenderer.invoke('mcp:servers:list'),
   reloadMcpServers: () => ipcRenderer.invoke('mcp:servers:reload'),
+  saveMcpSecurity: (security: any) => ipcRenderer.invoke('mcp:security:save', security),
+  reloadMcpSecurity: () => ipcRenderer.invoke('mcp:security:reload'),
+  getMcpTools: () => ipcRenderer.invoke('mcp:tools:list'),
+  readLogs: () => ipcRenderer.invoke('logs:read'),
+  listMcpToolSnapshots: () => ipcRenderer.invoke('mcp:tool-snapshots:list'),
+  approveMcpToolSnapshot: (toolName: string) =>
+  ipcRenderer.invoke('mcp:tool-snapshots:approve', toolName),
 })
