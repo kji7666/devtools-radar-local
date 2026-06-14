@@ -1,2 +1,6 @@
 playwright
 pyyaml
+fastapi
+uvicorn[standard]
+pydantic
+httpx

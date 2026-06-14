@@ -13,11 +13,11 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, AsyncIterator, Optional, Union
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -1067,9 +1067,6 @@ class McpStdioClient:
                 {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {
-                        "roots": {
-                            "listChanged": False,
-                        },
                         "sampling": {},
                     },
                     "clientInfo": {
@@ -1296,9 +1293,6 @@ class McpStreamableHttpClient:
                 {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {
-                        "roots": {
-                            "listChanged": False,
-                        },
                         "sampling": {},
                     },
                     "clientInfo": {
@@ -1997,6 +1991,152 @@ def make_chat_response(
     }
 
 
+
+def _openai_sse_line(data: dict[str, Any]) -> str:
+    return "data: " + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+
+
+async def _openai_chat_completion_sse_from_response(
+    response: dict[str, Any],
+    *,
+    chunk_size: int = 800,
+) -> AsyncIterator[str]:
+    """Return OpenAI-compatible chat.completion.chunk SSE.
+
+    This is pseudo-streaming: the ChatGPT Web UI runner and MCP loop still run to
+    completion first. Then this function emits the final assistant message as SSE
+    chunks so clients such as OpenCode / AI SDK, which send stream=true, can read
+    the response without receiving a 400 error.
+    """
+
+    stream_id = str(response.get("id") or f"chatcmpl_{uuid.uuid4().hex}")
+    created = int(response.get("created") or now_ts())
+    model = str(response.get("model") or DEFAULT_MODEL)
+
+    choices = response.get("choices") or []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") or {}
+    finish_reason = first_choice.get("finish_reason") or "stop"
+
+    if not isinstance(message, dict):
+        message = {}
+
+    # 1) Initial role chunk.
+    yield _openai_sse_line(
+        {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+
+    tool_calls = message.get("tool_calls") or []
+
+    # 2A) Tool-call chunks, for clients that expect streamed tool calls.
+    if isinstance(tool_calls, list) and tool_calls:
+        for index, call in enumerate(tool_calls):
+            if not isinstance(call, dict):
+                continue
+
+            function = call.get("function") or {}
+            if not isinstance(function, dict):
+                function = {}
+
+            yield _openai_sse_line(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                                        "type": call.get("type") or "function",
+                                        "function": {
+                                            "name": str(function.get("name") or ""),
+                                            "arguments": str(function.get("arguments") or ""),
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            await asyncio.sleep(0)
+
+    # 2B) Normal content chunks.
+    else:
+        content = message.get("content")
+        text = "" if content is None else str(content)
+
+        for i in range(0, len(text), chunk_size):
+            piece = text[i : i + chunk_size]
+
+            yield _openai_sse_line(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": piece},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            await asyncio.sleep(0)
+
+    # 3) Finish chunk.
+    yield _openai_sse_line(
+        {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+    )
+
+    # 4) Done marker.
+    yield "data: [DONE]\n\n"
+
+
+def build_streaming_response_from_chat_response(response: dict[str, Any]) -> StreamingResponse:
+    return StreamingResponse(
+        _openai_chat_completion_sse_from_response(response),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 async def verify_auth(request: Request) -> None:
     expected_key = os.environ.get("DEVTOOLS_RADAR_API_KEY", "").strip()
 
@@ -2189,6 +2329,8 @@ async def health() -> dict[str, Any]:
         "pending_mcp_calls": len(pending_mcp_calls),
         "pending_mcp_calls_loaded": len(pending_mcp_calls),
         "mcp_supports_streamable_http": True,
+        "openai_chat_completions_stream": True,
+        "openai_chat_completions_stream_mode": "pseudo_stream_after_full_response",
         "mcp_tool_snapshots_exists": MCP_TOOL_SNAPSHOT_PATH.exists(),
         "mcp_tool_snapshots_count": len(mcp_tool_snapshots.snapshots),
         "version": SERVER_VERSION,
@@ -2581,15 +2723,12 @@ async def deny_mcp_call(pending_id: str, request: Request) -> dict[str, Any]:
     }
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSONResponse:
+@app.post("/v1/chat/completions", response_model=None)
+async def chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+) -> Response:
     await verify_auth(request)
-
-    if req.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="stream=true is not supported yet. Please use stream=false.",
-        )
 
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages is required")
@@ -2599,6 +2738,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request) -> JSON
 
     if "error" in result:
         return JSONResponse(status_code=500, content=result)
+
+    if req.stream:
+        return build_streaming_response_from_chat_response(result)
 
     return JSONResponse(content=result)
 

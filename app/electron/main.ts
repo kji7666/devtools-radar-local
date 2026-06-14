@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
 import { spawn } from 'node:child_process'
 
-const PROJECT_ROOT = 'D:\\side_project\\auto_gpt'
+const PROJECT_ROOT = path.resolve(app.getAppPath(), "..")
 const PYTHON_EXE = path.join(PROJECT_ROOT, '.venv', 'Scripts', 'python.exe')
 const MAIN_PY = path.join(PROJECT_ROOT, 'main.py')
 const TASK_RUNNER_PY = path.join(PROJECT_ROOT, 'task_runner.py')
