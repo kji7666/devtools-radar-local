@@ -25,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 MAIN_PY = BASE_DIR / "main.py"
 OUTPUT_TXT = BASE_DIR / "output.txt"
+RUNNER_LOCK_PATH = BASE_DIR / ".runner.lock"
 
 API_TMP_DIR = BASE_DIR / "api_tmp"
 API_LOG_DIR = BASE_DIR / "logs"
@@ -69,6 +70,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     tools: Optional[list[dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
+    parallel_tool_calls: Optional[bool] = None
     mcp: Optional[dict[str, Any]] = None
 
 
@@ -116,6 +118,86 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, len(text) // 4)
+
+def read_runner_lock_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "path": str(RUNNER_LOCK_PATH),
+        "exists": RUNNER_LOCK_PATH.exists(),
+        "pid": None,
+        "started_at": "",
+        "age_seconds": None,
+        "pid_alive": None,
+    }
+
+    if not RUNNER_LOCK_PATH.exists():
+        return info
+
+    try:
+        text = RUNNER_LOCK_PATH.read_text(encoding="utf-8", errors="replace")
+        info["raw"] = text
+
+        for line in text.splitlines():
+            if line.startswith("pid="):
+                try:
+                    info["pid"] = int(line.split("=", 1)[1].strip())
+                except Exception:
+                    pass
+            elif line.startswith("started_at="):
+                info["started_at"] = line.split("=", 1)[1].strip()
+
+        info["age_seconds"] = round(time.time() - RUNNER_LOCK_PATH.stat().st_mtime, 3)
+
+        pid = info.get("pid")
+        if isinstance(pid, int):
+            if os.name == "nt":
+                import subprocess
+
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                info["pid_alive"] = str(pid) in result.stdout
+            else:
+                try:
+                    os.kill(pid, 0)
+                    info["pid_alive"] = True
+                except OSError:
+                    info["pid_alive"] = False
+
+    except Exception as error:
+        info["error"] = f"{type(error).__name__}: {error}"
+
+    return info
+
+
+def cleanup_stale_runner_lock(max_age_seconds: int = 900) -> bool:
+    if not RUNNER_LOCK_PATH.exists():
+        return False
+
+    info = read_runner_lock_info()
+
+    pid_alive = info.get("pid_alive")
+    age_seconds = info.get("age_seconds")
+
+    should_remove = False
+
+    if pid_alive is False:
+        should_remove = True
+
+    if isinstance(age_seconds, (int, float)) and age_seconds > max_age_seconds:
+        should_remove = True
+
+    if not should_remove:
+        return False
+
+    try:
+        RUNNER_LOCK_PATH.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
 
 
 def read_output_text() -> str:
@@ -224,7 +306,6 @@ def build_messages_prompt(messages: list[ChatMessage]) -> str:
 
     return "\n\n".join(rendered).strip()
 
-
 def build_tools_prompt(tools: Optional[list[dict[str, Any]]], tool_choice: Any) -> str:
     if not tools:
         return ""
@@ -265,11 +346,15 @@ tool_choice:
 1. tool name 必須完全使用上面 tools 裡的 function.name。
 2. arguments 必須是合法 JSON object。
 3. 不要編造不存在的 tool name。
-4. 如果使用工具可以更準確回答，優先呼叫工具。
-5. 如果使用者已提供 tool_result，請根據 tool_result 給最終回答。
-6. 如果工具因安全策略被拒絕，請向使用者說明原因，不要假裝已執行。
-7. 如果工具回傳 pending_id，代表該工具需要人工確認，請清楚告訴使用者 pending_id。
-8. 最終回答請盡量保留 Markdown。
+4. 如果需要讀檔、改檔、列目錄、跑指令，必須優先呼叫工具，不要假裝已讀取或已修改。
+5. 如果使用者要求閱讀 AGENTS.md、docs/*.md、檢查 git diff、修改檔案，必須呼叫 OpenCode 提供的 read/edit/bash 等工具。
+6. 如果使用工具，只能輸出 <tool_call> 或 <tool_calls>，不要加任何自然語言。
+7. 不要把 tool call 包在 Markdown code block。
+8. arguments 必須是合法 JSON；Windows path 請優先使用正斜線，例如 C:/project/devtools-radar-local/AGENTS.md。
+9. 如果使用者已提供 tool_result，請根據 tool_result 繼續回答或決定下一個工具。
+10. 如果工具因安全策略被拒絕，請向使用者說明原因，不要假裝已執行。
+11. 如果工具回傳 pending_id，代表該工具需要人工確認，請清楚告訴使用者 pending_id。
+12. 最終回答請盡量保留 Markdown。
 """.strip()
 
 
@@ -306,36 +391,123 @@ def extract_tag(text: str, tag: str) -> Optional[str]:
     return match.group(1).strip()
 
 
+def escape_lone_backslashes_in_json_text(text: str) -> str:
+    """
+    Repair common ChatGPT Web tool-call JSON mistakes on Windows paths.
+
+    Example broken JSON:
+      {"filePath":"C:/project/devtools-radar-local/AGENTS.md"}
+
+    JSON requires backslashes inside strings to be escaped. This function only
+    doubles backslashes that are not valid JSON escapes while inside strings.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+
+    valid_json_escapes = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+                escaped = False
+            i += 1
+            continue
+
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+
+        if ch == '"':
+            out.append(ch)
+            in_string = False
+            i += 1
+            continue
+
+        if ch == "\\":
+            next_ch = text[i + 1] if i + 1 < len(text) else ""
+
+            if next_ch in valid_json_escapes:
+                out.append(ch)
+                escaped = True
+            else:
+                out.append("\\\\")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def try_parse_json(text: str) -> Any:
     text = text.strip()
 
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+    candidates: list[str] = [text]
+
+    repaired = escape_lone_backslashes_in_json_text(text)
+    if repaired != text:
+        candidates.append(repaired)
 
     code_block = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     if code_block:
-        try:
-            return json.loads(code_block.group(1).strip())
-        except Exception:
-            pass
-
-    first_obj = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-    if first_obj:
-        try:
-            return json.loads(first_obj.group(1))
-        except Exception:
-            pass
+        block = code_block.group(1).strip()
+        candidates.append(block)
+        repaired_block = escape_lone_backslashes_in_json_text(block)
+        if repaired_block != block:
+            candidates.append(repaired_block)
 
     first_array = re.search(r"(\[.*\])", text, flags=re.DOTALL)
     if first_array:
+        arr = first_array.group(1).strip()
+        candidates.append(arr)
+        repaired_arr = escape_lone_backslashes_in_json_text(arr)
+        if repaired_arr != arr:
+            candidates.append(repaired_arr)
+
+    first_obj = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+    if first_obj:
+        obj = first_obj.group(1).strip()
+        candidates.append(obj)
+        repaired_obj = escape_lone_backslashes_in_json_text(obj)
+        if repaired_obj != obj:
+            candidates.append(repaired_obj)
+
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+
+        seen.add(candidate)
+
         try:
-            return json.loads(first_array.group(1))
+            return json.loads(candidate)
         except Exception:
-            pass
+            continue
 
     return None
+
+def normalize_tool_arguments_for_opencode(arguments_obj: Any) -> dict[str, Any]:
+    if isinstance(arguments_obj, dict):
+        normalized = dict(arguments_obj)
+    else:
+        normalized = {"input": arguments_obj}
+
+    for key in ["filePath", "filepath", "path", "repo_path", "source", "destination", "target"]:
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = value.replace("\\", "/")
+
+    return normalized
 
 
 def normalize_tool_call(raw: dict[str, Any]) -> dict[str, Any]:
@@ -353,14 +525,17 @@ def normalize_tool_call(raw: dict[str, Any]) -> dict[str, Any]:
         arguments = {}
 
     if isinstance(arguments, str):
-        try:
-            arguments_obj = json.loads(arguments)
-        except Exception:
+        parsed_args = try_parse_json(arguments)
+        if isinstance(parsed_args, dict):
+            arguments_obj = parsed_args
+        else:
             arguments_obj = {"input": arguments}
     elif isinstance(arguments, dict):
         arguments_obj = arguments
     else:
         arguments_obj = {"input": arguments}
+
+    arguments_obj = normalize_tool_arguments_for_opencode(arguments_obj)
 
     if not name:
         name = "unknown_tool"
@@ -374,28 +549,50 @@ def normalize_tool_call(raw: dict[str, Any]) -> dict[str, Any]:
         },
     }
 
-
 def parse_assistant_output(text: str) -> tuple[str, Optional[list[dict[str, Any]]]]:
+    if not text:
+        return "", None
+
     tool_calls_block = extract_tag(text, "tool_calls")
     if tool_calls_block:
         parsed = try_parse_json(tool_calls_block)
         if isinstance(parsed, list):
-            return "", [normalize_tool_call(x) for x in parsed if isinstance(x, dict)]
+            calls = [normalize_tool_call(x) for x in parsed if isinstance(x, dict)]
+            if calls:
+                return "", calls
+        elif isinstance(parsed, dict):
+            return "", [normalize_tool_call(parsed)]
 
     tool_call_block = extract_tag(text, "tool_call")
     if tool_call_block:
         parsed = try_parse_json(tool_call_block)
         if isinstance(parsed, dict):
             return "", [normalize_tool_call(parsed)]
+        elif isinstance(parsed, list):
+            calls = [normalize_tool_call(x) for x in parsed if isinstance(x, dict)]
+            if calls:
+                return "", calls
+
+    # Fallback: sometimes the model outputs raw JSON without clean XML.
+    stripped = text.strip()
+    if '"name"' in stripped and '"arguments"' in stripped:
+        parsed = try_parse_json(stripped)
+        if isinstance(parsed, dict):
+            return "", [normalize_tool_call(parsed)]
+        if isinstance(parsed, list):
+            calls = [normalize_tool_call(x) for x in parsed if isinstance(x, dict)]
+            if calls:
+                return "", calls
 
     final_block = extract_tag(text, "final")
     if final_block is not None:
         return final_block, None
 
     return text.strip(), None
-
+    
 
 async def run_main_with_prompt(prompt: str, timeout_seconds: int = 900) -> tuple[int, str, str, str]:
+    cleanup_stale_runner_lock(max_age_seconds=timeout_seconds)
     if not MAIN_PY.exists():
         return 1, "", f"main.py not found: {MAIN_PY}", ""
 
@@ -433,6 +630,7 @@ async def run_main_with_prompt(prompt: str, timeout_seconds: int = 900) -> tuple
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
+            cleanup_stale_runner_lock(max_age_seconds=0)
             return 124, "", f"Timeout after {timeout_seconds} seconds", read_output_text()
 
         stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -442,7 +640,7 @@ async def run_main_with_prompt(prompt: str, timeout_seconds: int = 900) -> tuple
 
     finally:
         try:
-            prompt_file.unlink(missing_ok=True)
+            cleanup_stale_runner_lock(max_age_seconds=0)
         except Exception:
             pass
 
@@ -1949,6 +2147,51 @@ mcp_manager = McpManager()
 load_pending_mcp_calls_from_log()
 compact_pending_mcp_log()
 
+def coerce_response_tool_calls(response: dict[str, Any]) -> dict[str, Any]:
+    """
+    Final safety bridge:
+
+    If ChatGPT Web returned textual:
+      <tool_call>...</tool_call>
+      <tool_calls>...</tool_calls>
+
+    but earlier parser missed it, convert it into OpenAI-compatible
+    assistant.tool_calls before returning to OpenCode / AI SDK.
+    """
+    try:
+        choices = response.get("choices") or []
+        if not choices:
+            return response
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return response
+
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            return response
+
+        # Already correct.
+        if message.get("tool_calls"):
+            choice["finish_reason"] = "tool_calls"
+            return response
+
+        content = message.get("content")
+        if not isinstance(content, str):
+            return response
+
+        parsed_content, parsed_tool_calls = parse_assistant_output(content)
+
+        if parsed_tool_calls:
+            message["content"] = None
+            message["tool_calls"] = parsed_tool_calls
+            choice["finish_reason"] = "tool_calls"
+
+        return response
+
+    except Exception:
+        return response
+
 
 def make_chat_response(
     req: ChatCompletionRequest,
@@ -2126,6 +2369,8 @@ async def _openai_chat_completion_sse_from_response(
 
 
 def build_streaming_response_from_chat_response(response: dict[str, Any]) -> StreamingResponse:
+    response = coerce_response_tool_calls(response)
+
     return StreamingResponse(
         _openai_chat_completion_sse_from_response(response),
         media_type="text/event-stream",
@@ -2194,12 +2439,37 @@ def assistant_tool_call_message(tool_calls: list[dict[str, Any]]) -> ChatMessage
         tool_calls=tool_calls,
     )
 
+def request_wants_mcp_tools(req: ChatCompletionRequest) -> bool:
+    """
+    OpenCode native tool calling path:
+      req.tools contains read/edit/bash etc.
+      In that mode, do not auto-append MCP tools unless caller explicitly asks.
+
+    Direct API / MCP path:
+      no req.tools, or req.mcp.enabled=true.
+    """
+    if isinstance(req.mcp, dict):
+        if req.mcp.get("enabled") is False:
+            return False
+        if req.mcp.get("enabled") is True:
+            return True
+
+    # If OpenCode/AI SDK provides native tools, keep the tool list clean.
+    if req.tools:
+        return False
+
+    return True
+
 
 async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
     messages = [ChatMessage(**m.model_dump()) for m in req.messages]
 
-    mcp_tools = await mcp_manager.list_tools()
     request_tools = req.tools or []
+
+    if request_wants_mcp_tools(req):
+        mcp_tools = await mcp_manager.list_tools()
+    else:
+        mcp_tools = []
 
     all_tools = [*request_tools, *mcp_tools]
 
@@ -2236,16 +2506,19 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
                 raw_output=raw_output,
             )
 
-        executable_calls = []
-        external_calls = []
+        executable_calls: list[dict[str, Any]] = []
+        external_calls: list[dict[str, Any]] = []
 
         for call in tool_calls:
             name = tool_call_name(call)
+
             if mcp_manager.is_mcp_tool(name):
                 executable_calls.append(call)
             else:
                 external_calls.append(call)
 
+        # OpenCode native tools, such as read/edit/bash, must be returned to
+        # OpenCode as assistant.tool_calls. Do not execute them inside this API.
         if external_calls and not executable_calls:
             return make_chat_response(
                 req=req,
@@ -2268,6 +2541,8 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
 
             messages.append(tool_result_message(call, result_text))
 
+        # Mixed mode: execute MCP tools internally, return OpenCode native tools
+        # back to OpenCode.
         if external_calls:
             return make_chat_response(
                 req=req,
@@ -2289,7 +2564,6 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
         prompt_text=last_prompt,
         raw_output=raw_output,
     )
-
 
 app = FastAPI(
     title="DevTools Radar Local API",
@@ -2334,6 +2608,35 @@ async def health() -> dict[str, Any]:
         "mcp_tool_snapshots_exists": MCP_TOOL_SNAPSHOT_PATH.exists(),
         "mcp_tool_snapshots_count": len(mcp_tool_snapshots.snapshots),
         "version": SERVER_VERSION,
+    }
+
+@app.get("/v1/debug/runner")
+async def debug_runner(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    return {
+        "runner_lock_locked": runner_lock.locked(),
+        "runner_lock_file": read_runner_lock_info(),
+        "main_py": str(MAIN_PY),
+        "main_py_exists": MAIN_PY.exists(),
+        "output_txt": str(OUTPUT_TXT),
+        "output_txt_exists": OUTPUT_TXT.exists(),
+        "base_dir": str(BASE_DIR),
+    }
+
+
+@app.post("/v1/debug/runner/cleanup-lock")
+async def debug_cleanup_runner_lock(request: Request) -> dict[str, Any]:
+    await verify_auth(request)
+
+    before = read_runner_lock_info()
+    removed = cleanup_stale_runner_lock(max_age_seconds=0)
+    after = read_runner_lock_info()
+
+    return {
+        "removed": removed,
+        "before": before,
+        "after": after,
     }
 
 
@@ -2722,7 +3025,6 @@ async def deny_mcp_call(pending_id: str, request: Request) -> dict[str, Any]:
         "approval": record,
     }
 
-
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     req: ChatCompletionRequest,
@@ -2733,17 +3035,20 @@ async def chat_completions(
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
+    cleanup_stale_runner_lock(max_age_seconds=900)
+
     async with runner_lock:
         result = await run_chat_with_mcp_loop(req)
 
     if "error" in result:
         return JSONResponse(status_code=500, content=result)
 
+    result = coerce_response_tool_calls(result)
+
     if req.stream:
         return build_streaming_response_from_chat_response(result)
 
     return JSONResponse(content=result)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -2768,3 +3073,31 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# =========================
+# DEBUG ENDPOINTS (ADDED FIX)
+# =========================
+
+@app.get("/v1/debug/runner")
+async def debug_runner():
+    return {
+        "locked": runner_lock.locked(),
+        "runner_lock_file": str(BASE_DIR / ".runner.lock"),
+        "exists": (BASE_DIR / ".runner.lock").exists(),
+    }
+
+
+@app.get("/v1/debug/prompt-traces")
+async def debug_prompt_traces():
+    p = BASE_DIR / "logs" / "prompt_traces"
+    if not p.exists():
+        return {"traces": []}
+
+    out = []
+    for d in sorted(p.iterdir(), reverse=True):
+        if d.is_dir():
+            out.append({
+                "trace_id": d.name,
+                "files": [f.name for f in d.iterdir()]
+            })
+    return {"traces": out}
