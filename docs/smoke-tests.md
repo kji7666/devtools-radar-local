@@ -36,3 +36,5 @@ AGENTS_OK
 
 git status
 git diff --stat
+OpenCode verified OK
+OpenCode integration verified
