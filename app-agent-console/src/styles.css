@@ -1,0 +1,211 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f1117;
+  color: #f2f3f5;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; overflow: hidden; }
+button, input { font: inherit; }
+
+.shell {
+  display: grid;
+  grid-template-columns: 72px 280px minmax(420px, 1fr) 380px;
+  height: 100vh;
+  background: #111318;
+}
+
+.rail {
+  background: #0b0d12;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 10px;
+  border-right: 1px solid #20232d;
+}
+
+.logo {
+  width: 46px;
+  height: 46px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  background: #5865f2;
+  font-weight: 800;
+}
+
+.rail-item {
+  width: 46px;
+  height: 46px;
+  border: 0;
+  border-radius: 16px;
+  background: #1e222c;
+  color: #b5bac1;
+  cursor: pointer;
+}
+
+.rail-item.active, .rail-item:hover {
+  background: #31364a;
+  color: white;
+}
+
+.sidebar {
+  background: #171a21;
+  border-right: 1px solid #20232d;
+  padding: 18px 14px;
+  overflow: auto;
+}
+
+.sidebar h1 { font-size: 18px; margin: 0 0 8px; }
+.sidebar h2 { color: #949ba4; font-size: 12px; text-transform: uppercase; margin: 24px 8px 8px; }
+.status { color: #23a55a; font-size: 13px; margin: 0 0 18px; }
+
+.channel {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 24px 1fr auto;
+  gap: 8px;
+  align-items: center;
+  border: 0;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: transparent;
+  color: #b5bac1;
+  text-align: left;
+  cursor: pointer;
+}
+
+.channel:hover, .channel.active {
+  background: #2b2d35;
+  color: white;
+}
+
+.channel b {
+  font-size: 11px;
+  color: #949ba4;
+}
+
+.timeline {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  background: #1e2129;
+}
+
+.timeline header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 22px;
+  border-bottom: 1px solid #2b2f3a;
+}
+
+.timeline header h2 { margin: 0; font-size: 20px; }
+.timeline header p { margin: 4px 0 0; color: #949ba4; }
+
+.ghost, .timeline footer button, .primary {
+  border: 0;
+  border-radius: 8px;
+  padding: 9px 12px;
+  background: #5865f2;
+  color: white;
+  cursor: pointer;
+}
+
+.ghost { background: #31364a; }
+.events { padding: 18px 20px; overflow: auto; }
+
+.event {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.event:hover, .event.selected { background: #292d38; }
+
+.event-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: #31364a;
+  color: white;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.event-head { display: flex; align-items: center; gap: 10px; }
+.event-head span { color: #949ba4; font-size: 12px; }
+.event h3 { margin: 5px 0; font-size: 15px; }
+.event p { margin: 0; color: #c6cbd2; }
+
+.level {
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: #31364a;
+  color: #d8dcff;
+}
+
+.level.error { background: #5c1f2a; color: #ffb3c1; }
+.level.masked { background: #4a3a15; color: #ffd27a; }
+.level.diff { background: #173f2a; color: #9ee6b5; }
+
+.timeline footer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid #2b2f3a;
+}
+
+.timeline footer input {
+  border: 1px solid #313642;
+  border-radius: 10px;
+  background: #111318;
+  color: #c6cbd2;
+  padding: 11px 12px;
+}
+
+.inspector {
+  background: #171a21;
+  border-left: 1px solid #20232d;
+  padding: 18px;
+  overflow: auto;
+}
+
+.inspector-card, .config-card {
+  border: 1px solid #2b2f3a;
+  background: #1e2129;
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.inspector-card h2, .config-card h2 { margin: 0 0 6px; font-size: 18px; }
+.muted, .config-card p { color: #949ba4; }
+
+.tabs { display: flex; gap: 8px; margin: 14px 0; }
+.tabs button { border: 0; border-radius: 8px; padding: 7px 10px; background: #31364a; color: #d8dcff; }
+
+pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0f1117;
+  border: 1px solid #2b2f3a;
+  border-radius: 10px;
+  padding: 12px;
+  color: #d6d9df;
+}
+
+.diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 12px 0;
+}
