@@ -104,7 +104,14 @@ const state = {
   channel: "api",
   event: "evt-1",
   inspectorTab: "overview",
-  query: ""
+  query: "",
+  apiStatus: {
+    loading: true,
+    online: false,
+    health: null,
+    models: [],
+    error: null
+  }
 };
 
 function getCurrentChannel() {
@@ -172,9 +179,54 @@ function renderConfigMock() {
   return `<section class="config-card"><h2>設定檔樹</h2><p>目前是 mock 編輯器，不會真的寫入檔案。</p><div class="file-tree">${configFiles.map((file) => `<button>${file}</button>`).join("")}</div><h2>設定檔差異預覽</h2><div class="diff"><div><h4>修改前</h4><pre>- model: old-model&#10;- apiKey: sk-live-secret&#10;- timeout: 30000</pre></div><div><h4>修改後</h4><pre>+ model: devtools-radar/chatgpt-web-local&#10;+ apiKey: ***已遮蔽***&#10;+ timeout: 600000</pre></div></div><button class="primary">儲存前先檢查差異</button></section>`;
 }
 
+async function refreshApiStatus() {
+  state.apiStatus.loading = true;
+  state.apiStatus.error = null;
+  render();
+
+  try {
+    const healthRes = await fetch("/api-local/health");
+    const health = await healthRes.json();
+
+    const modelsRes = await fetch("/api-local/v1/models");
+    const modelsJson = await modelsRes.json();
+
+    state.apiStatus = {
+      loading: false,
+      online: true,
+      health,
+      models: modelsJson.data || [],
+      error: null
+    };
+  } catch (error) {
+    state.apiStatus = {
+      loading: false,
+      online: false,
+      health: null,
+      models: [],
+      error: error.message
+    };
+  }
+
+  render();
+}
+
+function renderApiStatusText() {
+  if (state.apiStatus.loading) {
+    return "● 正在檢查 API · http://127.0.0.1:8788";
+  }
+
+  if (state.apiStatus.online) {
+    const modelCount = state.apiStatus.models.length;
+    return `● API 在線上 · models=${modelCount}`;
+  }
+
+  return `● API 離線 · ${state.apiStatus.error || "無法連線"}`;
+}
+
 function render() {
   const currentChannel = getCurrentChannel();
-  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status">● API 在線上 · mock 模式</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">Mock 資料</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">${renderRunSummary()}${renderTimeline()}${state.channel === "config" ? renderConfigMock() : ""}</section><footer><input value="/搜尋 模型請求" readonly /><button>執行</button></footer></main><aside class="inspector">${renderInspector()}</aside></div>`;
+  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status ${state.apiStatus.online ? "online" : "offline"}">${renderApiStatusText()}</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">Mock 資料</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">${renderRunSummary()}${renderTimeline()}${state.channel === "config" ? renderConfigMock() : ""}</section><footer><input value="/搜尋 模型請求" readonly /><button>執行</button></footer></main><aside class="inspector">${renderInspector()}</aside></div>`;
 
   document.querySelectorAll(".channel[data-channel]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -227,3 +279,5 @@ function render() {
 }
 
 render();
+refreshApiStatus();
+setInterval(refreshApiStatus, 10000);
