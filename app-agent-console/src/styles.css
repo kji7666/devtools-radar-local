@@ -209,3 +209,118 @@ pre {
   gap: 12px;
   margin: 12px 0;
 }
+
+
+.toolbar {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid #2b2f3a;
+}
+
+.search-box {
+  border: 1px solid #313642;
+  border-radius: 10px;
+  background: #111318;
+  color: #f2f3f5;
+  padding: 10px 12px;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.summary-grid div {
+  border: 1px solid #2b2f3a;
+  background: #171a21;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.summary-grid strong {
+  display: block;
+  font-size: 22px;
+}
+
+.summary-grid span {
+  color: #949ba4;
+  font-size: 12px;
+}
+
+.event-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.mini-button {
+  border: 0;
+  border-radius: 8px;
+  background: #31364a;
+  color: #d8dcff;
+  padding: 6px 9px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.full-block {
+  margin-top: 10px;
+  border-left: 3px solid #5865f2;
+  background: #171a21;
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #d6d9df;
+  line-height: 1.55;
+}
+
+.tabs button.active-tab {
+  background: #5865f2;
+  color: white;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.kv div {
+  border: 1px solid #2b2f3a;
+  background: #111318;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.kv span {
+  display: block;
+  color: #949ba4;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.file-tree {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 18px;
+}
+
+.file-tree button {
+  border: 1px solid #2b2f3a;
+  border-radius: 8px;
+  background: #111318;
+  color: #d6d9df;
+  text-align: left;
+  padding: 9px 10px;
+}
+
+.empty {
+  color: #949ba4;
+  border: 1px dashed #3a3f4d;
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+}
