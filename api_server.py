@@ -19,7 +19,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
-
+from runtime_event_log import append_event, read_recent_events
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -2882,6 +2882,20 @@ async def save_mcp_security(payload: dict[str, Any], request: Request) -> dict[s
     }
 
 
+@app.get("/v1/debug/events")
+def debug_events(limit: int = 200):
+    event = append_event(
+        source="devtools-radar-api",
+        event_type="debug_events_read",
+        title="讀取 runtime events",
+        preview=f"limit={limit}",
+        payload={"limit": limit},
+    )
+    return {
+        "data": read_recent_events(limit),
+        "latest_event_id": event["id"],
+    }
+    
 @app.post("/v1/mcp/security/reload")
 async def reload_mcp_security(request: Request) -> dict[str, Any]:
     await verify_auth(request)
