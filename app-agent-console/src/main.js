@@ -116,6 +116,12 @@ const state = {
     loading: true,
     data: null,
     error: null
+  },
+  runtimeEvents: {
+    loading: true,
+    data: [],
+    error: null,
+    usingMock: true
   }
 };
 
@@ -124,12 +130,44 @@ function getCurrentChannel() {
 }
 
 function getCurrentEvent() {
-  return events.find((event) => event.id === state.event) || visibleEvents()[0] || events[0];
+  const source = getEventSource();
+  return source.find((event) => event.id === state.event) || visibleEvents()[0] || source[0] || events[0];
+}
+
+function mapRuntimeEventToUiEvent(event) {
+  const type = event.type || "";
+  let channel = "api";
+
+  if (type.includes("opencode")) channel = "opencode";
+  else if (type.includes("model")) channel = "model";
+  else if (type.includes("tool") || type.includes("mcp")) channel = "mcp";
+  else if (type.includes("config")) channel = "config";
+  else if (event.level === "error") channel = "errors";
+
+  return {
+    id: event.id || crypto.randomUUID(),
+    channel,
+    time: event.ts ? new Date(event.ts).toLocaleTimeString("zh-TW", { hour12: false }) : "--:--:--",
+    source: event.source || "runtime",
+    level: event.level || "資訊",
+    title: event.title || event.type || "Runtime Event",
+    preview: event.preview || "",
+    full: event.preview || event.title || "",
+    payload: event
+  };
+}
+
+function getEventSource() {
+  if (state.runtimeEvents.data.length > 0) {
+    return state.runtimeEvents.data.map(mapRuntimeEventToUiEvent);
+  }
+
+  return events;
 }
 
 function visibleEvents() {
   const query = state.query.trim().toLowerCase();
-  return events.filter((event) => {
+  return getEventSource().filter((event) => {
     const sameChannel = event.channel === state.channel;
     const text = `${event.source} ${event.title} ${event.preview} ${event.full}`.toLowerCase();
     return sameChannel && (!query || text.includes(query));
@@ -141,10 +179,11 @@ function renderChannels() {
 }
 
 function renderRunSummary() {
-  const total = events.length;
-  const errors = events.filter((event) => event.level === "錯誤").length;
-  const masked = events.filter((event) => event.level === "已遮蔽").length;
-  const tools = events.filter((event) => event.channel === "mcp").length;
+  const source = getEventSource();
+  const total = source.length;
+  const errors = source.filter((event) => event.level === "錯誤" || event.level === "error").length;
+  const masked = source.filter((event) => event.level === "已遮蔽" || event.redaction_status === "masked").length;
+  const tools = source.filter((event) => event.channel === "mcp").length;
   return `<section class="summary-grid"><div><strong>${total}</strong><span>事件</span></div><div><strong>${tools}</strong><span>工具</span></div><div><strong>${masked}</strong><span>遮蔽</span></div><div><strong>${errors}</strong><span>錯誤</span></div></section>`;
 }
 
@@ -266,6 +305,36 @@ async function refreshRunnerDebug() {
   render();
 }
 
+async function refreshRuntimeEvents() {
+  state.runtimeEvents.loading = true;
+
+  try {
+    const res = await fetch("/api-local/v1/debug/events?limit=200");
+    const json = await res.json();
+
+    state.runtimeEvents = {
+      loading: false,
+      data: json.data || [],
+      error: null,
+      usingMock: false
+    };
+
+    const source = getEventSource();
+    if (!source.find((event) => event.id === state.event) && source[0]) {
+      state.event = source[0].id;
+    }
+  } catch (error) {
+    state.runtimeEvents = {
+      loading: false,
+      data: [],
+      error: error.message,
+      usingMock: true
+    };
+  }
+
+  render();
+}
+
 function renderApiStatusText() {
   if (state.apiStatus.loading) {
     return "● 正在檢查 API · http://127.0.0.1:8788";
@@ -281,7 +350,7 @@ function renderApiStatusText() {
 
 function render() {
   const currentChannel = getCurrentChannel();
-  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status ${state.apiStatus.online ? "online" : "offline"}">${renderApiStatusText()}</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">Mock 資料</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">
+  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status ${state.apiStatus.online ? "online" : "offline"}">${renderApiStatusText()}</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">${state.runtimeEvents.usingMock ? "Mock 資料" : "真實事件"}</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">
   ${renderRunSummary()}
   ${state.channel === "api" ? renderRunnerDebugCard() : ""}
   ${renderTimeline()}
@@ -341,6 +410,8 @@ function render() {
 render();
 refreshApiStatus();
 refreshRunnerDebug();
+refreshRuntimeEvents();
 
 setInterval(refreshApiStatus, 10000);
 setInterval(refreshRunnerDebug, 10000);
+setInterval(refreshRuntimeEvents, 3000);
