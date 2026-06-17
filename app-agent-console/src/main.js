@@ -111,6 +111,11 @@ const state = {
     health: null,
     models: [],
     error: null
+  },
+  runnerDebug: {
+    loading: true,
+    data: null,
+    error: null
   }
 };
 
@@ -141,6 +146,33 @@ function renderRunSummary() {
   const masked = events.filter((event) => event.level === "已遮蔽").length;
   const tools = events.filter((event) => event.channel === "mcp").length;
   return `<section class="summary-grid"><div><strong>${total}</strong><span>事件</span></div><div><strong>${tools}</strong><span>工具</span></div><div><strong>${masked}</strong><span>遮蔽</span></div><div><strong>${errors}</strong><span>錯誤</span></div></section>`;
+}
+
+function renderRunnerDebugCard() {
+  if (state.runnerDebug.loading) {
+    return `<section class="debug-card"><h2>Runner Debug</h2><p>正在讀取 runner 狀態...</p></section>`;
+  }
+
+  if (state.runnerDebug.error) {
+    return `<section class="debug-card error-card"><h2>Runner Debug</h2><p>${state.runnerDebug.error}</p></section>`;
+  }
+
+  const data = state.runnerDebug.data || {};
+  const lock = data.runner_lock_locked ? "鎖定中" : "未鎖定";
+  const mainPy = data.main_py_exists ? "存在" : "不存在";
+  const outputTxt = data.output_txt_exists ? "存在" : "不存在";
+
+  return `
+    <section class="debug-card">
+      <h2>Runner Debug</h2>
+      <div class="kv">
+        <div><span>Runner Lock</span><strong>${lock}</strong></div>
+        <div><span>main.py</span><strong>${mainPy}</strong></div>
+        <div><span>output.txt</span><strong>${outputTxt}</strong></div>
+        <div><span>Base Dir</span><strong>${data.base_dir || "未知"}</strong></div>
+      </div>
+    </section>
+  `;
 }
 
 function renderTimeline() {
@@ -211,6 +243,29 @@ async function refreshApiStatus() {
   render();
 }
 
+async function refreshRunnerDebug() {
+  state.runnerDebug.loading = true;
+
+  try {
+    const res = await fetch("/api-local/v1/debug/runner");
+    const data = await res.json();
+
+    state.runnerDebug = {
+      loading: false,
+      data,
+      error: null
+    };
+  } catch (error) {
+    state.runnerDebug = {
+      loading: false,
+      data: null,
+      error: error.message
+    };
+  }
+
+  render();
+}
+
 function renderApiStatusText() {
   if (state.apiStatus.loading) {
     return "● 正在檢查 API · http://127.0.0.1:8788";
@@ -226,7 +281,12 @@ function renderApiStatusText() {
 
 function render() {
   const currentChannel = getCurrentChannel();
-  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status ${state.apiStatus.online ? "online" : "offline"}">${renderApiStatusText()}</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">Mock 資料</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">${renderRunSummary()}${renderTimeline()}${state.channel === "config" ? renderConfigMock() : ""}</section><footer><input value="/搜尋 模型請求" readonly /><button>執行</button></footer></main><aside class="inspector">${renderInspector()}</aside></div>`;
+  document.querySelector("#app").innerHTML = `<div class="shell"><aside class="rail"><div class="logo">DR</div><button class="rail-item active">API</button><button class="rail-item">OC</button><button class="rail-item">MCP</button><button class="rail-item">設定</button></aside><aside class="sidebar"><h1>DevTools Radar</h1><p class="status ${state.apiStatus.online ? "online" : "offline"}">${renderApiStatusText()}</p><h2>執行觀察</h2>${renderChannels()}<h2>執行紀錄</h2><button class="channel"><span>◎</span><span>最新執行</span><b>現在</b></button><button class="channel"><span>◌</span><span>歷史紀錄</span><b>12</b></button></aside><main class="timeline"><header><div><h2># ${currentChannel.name}</h2><p>Runtime 觀察預覽。Prompt 與 Response 預設只顯示摘要，點開才看完整內容。</p></div><button class="ghost">Mock 資料</button></header><section class="toolbar"><input id="searchBox" class="search-box" value="${state.query}" placeholder="搜尋目前 channel，例如：模型、tool、timeout" /><button id="clearSearch" class="ghost">清除</button></section><section class="events">
+  ${renderRunSummary()}
+  ${state.channel === "api" ? renderRunnerDebugCard() : ""}
+  ${renderTimeline()}
+  ${state.channel === "config" ? renderConfigMock() : ""}
+</section><footer><input value="/搜尋 模型請求" readonly /><button>執行</button></footer></main><aside class="inspector">${renderInspector()}</aside></div>`;
 
   document.querySelectorAll(".channel[data-channel]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -280,4 +340,7 @@ function render() {
 
 render();
 refreshApiStatus();
+refreshRunnerDebug();
+
 setInterval(refreshApiStatus, 10000);
+setInterval(refreshRunnerDebug, 10000);

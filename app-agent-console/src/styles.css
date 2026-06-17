@@ -332,3 +332,25 @@ pre {
 .status.offline {
   color: #f23f42;
 }
+
+.debug-card {
+  border: 1px solid #2b2f3a;
+  background: #171a21;
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.debug-card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+
+.debug-card p {
+  color: #949ba4;
+  margin: 0;
+}
+
+.error-card {
+  border-color: #5c1f2a;
+}
