@@ -6,6 +6,11 @@ import fnmatch
 import hashlib
 import json
 import os
+if os.name == "nt":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 import re
 import shutil
 import sys
@@ -19,7 +24,33 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
-from runtime_event_log import append_event, read_recent_events
+from runtime_event_log import (
+    append_event,
+    read_recent_events,
+    read_run_events,
+    clear_events,
+    export_events_text,
+    get_event_stats,
+    start_run,
+    finish_run,
+    set_current_run_id,
+    reset_current_run_id,
+    list_runs,
+    delete_run,
+)
+from runtime_event_summarizer import (
+    summarize_chat_request,
+    summarize_chat_response,
+    summarize_tool_calls_from_response,
+    summarize_error,
+    build_text_debug_fields,
+)
+from runtime_lifecycle_summarizer import (
+    summarize_opencode_request,
+    summarize_mcp_tool_call,
+    summarize_tool_result,
+    summarize_loop_result,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -2418,6 +2449,11 @@ def tool_call_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
 
     return {"input": raw}
 
+def safe_append_event(**kwargs):
+    try:
+        return append_event(**kwargs)
+    except Exception:
+        return None
 
 def tool_call_name(tool_call: dict[str, Any]) -> str:
     fn = tool_call.get("function") or {}
@@ -2462,6 +2498,18 @@ def request_wants_mcp_tools(req: ChatCompletionRequest) -> bool:
 
 
 async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
+    loop_started_at = time.perf_counter()
+
+    safe_append_event(
+        source="mcp-runtime",
+        event_type="mcp_native_loop_entered",
+        title="進入 native tool loop",
+        preview="run_chat_with_mcp_loop entered",
+        payload={
+            "request_type": type(req).__name__,
+        },
+    )
+
     messages = [ChatMessage(**m.model_dump()) for m in req.messages]
 
     request_tools = req.tools or []
@@ -2484,9 +2532,41 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
         )
         last_prompt = prompt_text
 
-        code, stdout, stderr, raw_output = await run_main_with_prompt(prompt_text)
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_loop_iteration_started",
+            title="MCP loop iteration 開始",
+            preview=f"loop_index={_loop_index} tools={len(all_tools)} messages={len(messages)}",
+            payload={
+                "loop_index": _loop_index,
+                "tools_count": len(all_tools),
+                "messages_count": len(messages),
+                "prompt_length": len(prompt_text),
+                "prompt_preview": "***masked***",
+            },
+        )
+
+        code, stdout, stderr, raw_output = await run_main_with_prompt(
+            prompt_text,
+            timeout_seconds=120,
+        )
 
         if code != 0:
+            safe_append_event(
+                source="mcp-runtime",
+                event_type="mcp_runner_error",
+                title="ChatGPT Web runner 失敗",
+                preview=f"code={code}",
+                level="error",
+                payload={
+                    "code": code,
+                    "stdout_length": len(stdout or ""),
+                    "stderr_length": len(stderr or ""),
+                    "output_preview": "***masked***",
+                },
+                status="error",
+            )
+
             return {
                 "error": {
                     "message": stderr or stdout or "ChatGPT Web UI runner failed",
@@ -2496,6 +2576,21 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
             }
 
         content, tool_calls = parse_assistant_output(raw_output)
+
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_model_output_parsed",
+            title="模型輸出解析完成",
+            preview=f"tool_calls={len(tool_calls or [])} content_length={len(content or '')}",
+            payload={
+                "loop_index": _loop_index,
+                "content_length": len(content or ""),
+                **build_text_debug_fields("content", content),
+                "tool_calls_count": len(tool_calls or []),
+                "raw_output_length": len(raw_output or ""),
+                **build_text_debug_fields("raw_output", raw_output),
+            },
+        )
 
         if not tool_calls:
             return make_chat_response(
@@ -2517,9 +2612,34 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
             else:
                 external_calls.append(call)
 
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_tool_calls_classified",
+            title="工具呼叫分類完成",
+            preview=f"mcp={len(executable_calls)} external={len(external_calls)}",
+            payload={
+                "loop_index": _loop_index,
+                "mcp_tool_calls_count": len(executable_calls),
+                "external_tool_calls_count": len(external_calls),
+                "mcp_tool_calls": [summarize_mcp_tool_call(call) for call in executable_calls],
+                "external_tool_calls": [summarize_mcp_tool_call(call) for call in external_calls],
+            },
+        )
+
         # OpenCode native tools, such as read/edit/bash, must be returned to
         # OpenCode as assistant.tool_calls. Do not execute them inside this API.
         if external_calls and not executable_calls:
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_native_tool_calls_returned",
+                title="回傳 OpenCode native tool calls",
+                preview=f"external_tool_calls={len(external_calls)}",
+                payload={
+                    "external_tool_calls_count": len(external_calls),
+                    "external_tool_calls": [summarize_mcp_tool_call(call) for call in external_calls],
+                },
+            )
+
             return make_chat_response(
                 req=req,
                 content="",
@@ -2533,10 +2653,53 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
         for call in executable_calls:
             name = tool_call_name(call)
             args = tool_call_arguments(call)
+            tool_started_at = time.perf_counter()
+
+            safe_append_event(
+                source="mcp-runtime",
+                event_type="mcp_tool_started",
+                title="MCP 工具開始執行",
+                preview=f"tool={name}",
+                payload={
+                    "tool_name": name,
+                    "tool_call": summarize_mcp_tool_call(call),
+                },
+            )
 
             try:
                 result_text = await mcp_manager.call_tool(name, args)
+                tool_duration_ms = int((time.perf_counter() - tool_started_at) * 1000)
+
+                safe_append_event(
+                    source="mcp-runtime",
+                    event_type="mcp_tool_finished",
+                    title="MCP 工具執行完成",
+                    preview=f"tool={name} duration_ms={tool_duration_ms}",
+                    payload={
+                        "tool_name": name,
+                        "result": summarize_tool_result(result_text),
+                    },
+                    duration_ms=tool_duration_ms,
+                )
+
             except Exception as error:
+                tool_duration_ms = int((time.perf_counter() - tool_started_at) * 1000)
+
+                safe_append_event(
+                    source="mcp-runtime",
+                    event_type="mcp_tool_error",
+                    title="MCP 工具執行失敗",
+                    preview=f"tool={name} error={error}",
+                    level="error",
+                    payload={
+                        "tool_name": name,
+                        "error": str(error),
+                        "error_type": type(error).__name__,
+                    },
+                    status="error",
+                    duration_ms=tool_duration_ms,
+                )
+
                 result_text = f"[MCP_TOOL_ERROR]\n{name}\n{type(error).__name__}: {error}"
 
             messages.append(tool_result_message(call, result_text))
@@ -2544,6 +2707,17 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
         # Mixed mode: execute MCP tools internally, return OpenCode native tools
         # back to OpenCode.
         if external_calls:
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_mixed_tool_calls_returned",
+                title="回傳混合模式 OpenCode native tool calls",
+                preview=f"external_tool_calls={len(external_calls)}",
+                payload={
+                    "external_tool_calls_count": len(external_calls),
+                    "external_tool_calls": [summarize_mcp_tool_call(call) for call in external_calls],
+                },
+            )
+
             return make_chat_response(
                 req=req,
                 content="",
@@ -2555,6 +2729,23 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
     final_content = (
         "工具呼叫已達最大輪數，停止自動 MCP loop。\n\n"
         f"最後一次模型輸出：\n\n{raw_output}"
+    )
+
+    loop_duration_ms = int((time.perf_counter() - loop_started_at) * 1000)
+    safe_append_event(
+        source="mcp-runtime",
+        event_type="mcp_loop_max_iterations_reached",
+        title="MCP loop 達最大輪數",
+        preview=f"max_tool_loops={MAX_TOOL_LOOPS}",
+        level="warning",
+        payload={
+            "max_tool_loops": MAX_TOOL_LOOPS,
+            "duration_ms": loop_duration_ms,
+            "last_raw_output_length": len(raw_output or ""),
+            "last_raw_output_preview": "***masked***",
+        },
+        status="warning",
+        duration_ms=loop_duration_ms,
     )
 
     return make_chat_response(
@@ -2881,21 +3072,83 @@ async def save_mcp_security(payload: dict[str, Any], request: Request) -> dict[s
         "security": mcp_security.config,
     }
 
+@app.get("/v1/debug/runs")
+def debug_runs(limit: int = 50):
+    rows = list_runs(limit)
+    return {
+        "object": "list",
+        "data": rows,
+        "count": len(rows),
+    }
+
+
+@app.get("/v1/debug/runs/{run_id}/events")
+def debug_run_events(run_id: str, limit: int = 500):
+    return {
+        "run_id": run_id,
+        "data": read_run_events(run_id, limit),
+        "latest_event_id": None,
+    }
+
+
+@app.get("/v1/debug/runs/{run_id}/stats")
+def debug_run_stats(run_id: str):
+    return get_event_stats(run_id)
+
+
+@app.get("/v1/debug/runs/{run_id}/export")
+def debug_run_export(run_id: str):
+    return Response(
+        content=export_events_text(run_id),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="runtime-events-{run_id}.jsonl"'
+        },
+    )
+
+
+@app.delete("/v1/debug/runs/{run_id}")
+def debug_run_delete(run_id: str):
+    delete_run(run_id)
+    return {
+        "ok": True,
+        "deleted": run_id,
+    }
+
 
 @app.get("/v1/debug/events")
 def debug_events(limit: int = 200):
-    event = append_event(
-        source="devtools-radar-api",
-        event_type="debug_events_read",
-        title="讀取 runtime events",
-        preview=f"limit={limit}",
-        payload={"limit": limit},
-    )
     return {
         "data": read_recent_events(limit),
-        "latest_event_id": event["id"],
+        "latest_event_id": None,
     }
-    
+
+
+@app.get("/v1/debug/events/stats")
+def debug_events_stats():
+    return get_event_stats()
+
+
+@app.post("/v1/debug/events/clear")
+def debug_events_clear():
+    before = get_event_stats()
+    clear_events()
+    return {
+        "ok": True,
+        "cleared": before.get("total", 0),
+    }
+
+
+@app.get("/v1/debug/events/export")
+def debug_events_export():
+    return Response(
+        content=export_events_text(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": 'attachment; filename="runtime-events.jsonl"'
+        },
+    )
+
 @app.post("/v1/mcp/security/reload")
 async def reload_mcp_security(request: Request) -> dict[str, Any]:
     await verify_auth(request)
@@ -3038,80 +3291,224 @@ async def deny_mcp_call(pending_id: str, request: Request) -> dict[str, Any]:
         "status": "ok",
         "approval": record,
     }
-
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     req: ChatCompletionRequest,
     request: Request,
 ) -> Response:
+    started_at = time.perf_counter()
+    run_id = None
+    run_token = None
+
     await verify_auth(request)
 
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
-    cleanup_stale_runner_lock(max_age_seconds=900)
+    if hasattr(req, "model_dump"):
+        body = req.model_dump()
+    else:
+        body = req.dict()
 
-    async with runner_lock:
-        result = await run_chat_with_mcp_loop(req)
+    run_id = start_run({
+        "model": body.get("model"),
+        "stream": body.get("stream", False),
+        "messages_count": len(body.get("messages") or []),
+        "tools_count": len(body.get("tools") or []),
+    })
 
-    if "error" in result:
-        return JSONResponse(status_code=500, content=result)
+    run_token = set_current_run_id(run_id)
 
-    result = coerce_response_tool_calls(result)
+    request_summary = summarize_chat_request(body)
+    opencode_summary = summarize_opencode_request(body)
+    context_files = opencode_summary.get("context_files") or []
 
-    if req.stream:
-        return build_streaming_response_from_chat_response(result)
-
-    return JSONResponse(content=result)
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8788)
-    parser.add_argument("--reload", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    import uvicorn
-
-    args = parse_args()
-
-    uvicorn.run(
-        "api_server:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
+    safe_append_event(
+        source="devtools-radar-api",
+        event_type="model_request_received",
+        title="收到模型請求",
+        preview=(
+            f"model={body.get('model')} "
+            f"messages={len(body.get('messages') or [])} "
+            f"tools={len(body.get('tools') or [])} "
+            f"stream={body.get('stream', False)}"
+        ),
+        payload=request_summary,
     )
 
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_request_received",
+        title="OpenCode/API 請求進入",
+        preview=(
+            f"model={body.get('model')} "
+            f"messages={len(body.get('messages') or [])} "
+            f"tools={len(body.get('tools') or [])}"
+        ),
+        payload=opencode_summary,
+    )
 
-if __name__ == "__main__":
-    main()
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_context_files_detected",
+        title="偵測 context files",
+        preview=f"context_files={len(context_files)}",
+        payload={
+            "context_files_count": len(context_files),
+            "context_files": context_files,
+        },
+    )
 
-# =========================
-# DEBUG ENDPOINTS (ADDED FIX)
-# =========================
+    try:
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_loop_started",
+            title="MCP loop 開始",
+            preview=f"model={body.get('model')}",
+            payload={
+                "model": body.get("model"),
+                "stream": body.get("stream", False),
+            },
+        )
 
-@app.get("/v1/debug/runner")
-async def debug_runner():
-    return {
-        "locked": runner_lock.locked(),
-        "runner_lock_file": str(BASE_DIR / ".runner.lock"),
-        "exists": (BASE_DIR / ".runner.lock").exists(),
-    }
+        cleanup_stale_runner_lock(max_age_seconds=900)
 
+        async with runner_lock:
+            result = await run_chat_with_mcp_loop(req)
 
-@app.get("/v1/debug/prompt-traces")
-async def debug_prompt_traces():
-    p = BASE_DIR / "logs" / "prompt_traces"
-    if not p.exists():
-        return {"traces": []}
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_loop_completed",
+            title="MCP loop 完成",
+            preview="run_chat_with_mcp_loop completed",
+            payload=summarize_loop_result(result),
+        )
 
-    out = []
-    for d in sorted(p.iterdir(), reverse=True):
-        if d.is_dir():
-            out.append({
-                "trace_id": d.name,
-                "files": [f.name for f in d.iterdir()]
-            })
-    return {"traces": out}
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        if isinstance(result, dict) and "error" in result:
+            safe_append_event(
+                source="devtools-radar-api",
+                event_type="model_response_error",
+                title="模型請求失敗",
+                preview=str(result.get("error")),
+                level="error",
+                payload={
+                    "error": str(result.get("error")),
+                    "result_keys": list(result.keys()),
+                },
+                status="error",
+                duration_ms=duration_ms,
+            )
+
+            finish_run(run_id, status="error", duration_ms=duration_ms)
+
+            return JSONResponse(status_code=500, content=result)
+
+        result = coerce_response_tool_calls(result)
+
+        response_summary = summarize_chat_response(result)
+        tool_calls_summary = summarize_tool_calls_from_response(result)
+
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        safe_append_event(
+            source="devtools-radar-api",
+            event_type="model_response_sent",
+            title="送出模型回覆",
+            preview=(
+                f"duration_ms={duration_ms} "
+                f"stream={req.stream} "
+                f"tool_calls={len(tool_calls_summary)}"
+            ),
+            payload=response_summary,
+            duration_ms=duration_ms,
+        )
+
+        if tool_calls_summary:
+            safe_append_event(
+                source="devtools-radar-api",
+                event_type="mcp_tool_calls_requested",
+                title="模型要求工具呼叫",
+                preview=f"tool_calls={len(tool_calls_summary)}",
+                payload={
+                    "tool_calls_count": len(tool_calls_summary),
+                    "tool_calls": tool_calls_summary,
+                },
+                duration_ms=duration_ms,
+            )
+
+            for index, tool_call_summary in enumerate(tool_calls_summary):
+                safe_append_event(
+                    source="mcp-runtime",
+                    event_type="mcp_tool_call_requested",
+                    title="MCP 工具呼叫被要求",
+                    preview=(
+                        f"tool={tool_call_summary.get('name')} "
+                        f"index={index}"
+                    ),
+                    payload={
+                        "index": index,
+                        "tool_call": tool_call_summary,
+                    },
+                    duration_ms=duration_ms,
+                )
+
+        if req.stream:
+            safe_append_event(
+                source="devtools-radar-api",
+                event_type="model_streaming_response_built",
+                title="建立串流回覆",
+                preview="stream=true",
+                payload={
+                    "stream": True,
+                    "source_response_id": result.get("id") if isinstance(result, dict) else None,
+                    "note": "stream body is generated from summarized chat response",
+                },
+                duration_ms=duration_ms,
+            )
+
+            finish_run(run_id, status="completed", duration_ms=duration_ms)
+
+            return build_streaming_response_from_chat_response(result)
+
+        finish_run(run_id, status="completed", duration_ms=duration_ms)
+
+        return JSONResponse(content=result)
+
+    except Exception as error:
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        safe_append_event(
+            source="mcp-runtime",
+            event_type="mcp_loop_error",
+            title="MCP loop 例外",
+            preview=str(error),
+            level="error",
+            payload={
+                "error": str(error),
+                "error_type": type(error).__name__,
+            },
+            status="error",
+            duration_ms=duration_ms,
+        )
+
+        safe_append_event(
+            source="devtools-radar-api",
+            event_type="model_response_error",
+            title="模型請求例外",
+            preview=str(error),
+            level="error",
+            payload=summarize_error(error),
+            status="error",
+            duration_ms=duration_ms,
+        )
+
+        if run_id:
+            finish_run(run_id, status="error", duration_ms=duration_ms)
+
+        raise
+
+    finally:
+        if run_token is not None:
+            reset_current_run_id(run_token)

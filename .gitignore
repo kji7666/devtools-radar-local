@@ -110,3 +110,41 @@ Thumbs.db
 *.zip
 *.7z
 *.log
+# Local runtime / debug artifacts
+.logs/
+logs/
+runs/
+outputs/
+output.txt
+*.log
+*.lock
+
+# Python local env/cache
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node local env/build
+node_modules/
+dist/
+dist-electron/
+
+# Browser automation profiles
+browser_profile/
+edge_debug_profile/
+chrome_debug_profile/
+user_data_dir/
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
+
+# Temporary artifacts
+screenshots/
+archive/
+api_tmp/
