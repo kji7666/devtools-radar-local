@@ -243,6 +243,202 @@ textarea {
   font-size: 12px;
 }
 
+.flow-digest-card {
+  border: 1px solid #2b2f3a;
+  background: #171a21;
+  border-radius: 16px;
+  padding: 16px;
+  margin: 14px 0;
+}
+
+.flow-digest-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.flow-digest-head h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+
+.flow-digest-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.flow-digest-status {
+  margin: 12px 0 0;
+  color: #949ba4;
+  font-size: 13px;
+}
+
+.flow-digest-status.success {
+  color: #9df2c0;
+}
+
+.flow-digest-status.error {
+  color: #ffb3c1;
+}
+
+.pbv-summary-card,
+.pbv-handoff-card {
+  border: 1px solid #2b2f3a;
+  background: #171a21;
+  border-radius: 16px;
+  padding: 16px;
+  margin: 14px 0;
+}
+
+.pbv-summary-header,
+.pbv-handoff-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pbv-summary-header h2,
+.pbv-handoff-card h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+
+.pbv-handoff-card h3 {
+  margin-bottom: 12px;
+}
+
+.pbv-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.pbv-summary-grid.compact {
+  grid-template-columns: repeat(2, minmax(140px, 1fr));
+  margin-top: 10px;
+}
+
+.pbv-summary-grid div {
+  border: 1px solid #252a35;
+  border-radius: 12px;
+  background: #111318;
+  padding: 10px 12px;
+}
+
+.pbv-summary-grid span {
+  display: block;
+  color: #949ba4;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.pbv-summary-grid strong {
+  color: #f2f3f5;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.pbv-stage-table-wrap {
+  margin-top: 14px;
+  overflow-x: auto;
+}
+
+.pbv-stage-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+.pbv-stage-table th,
+.pbv-stage-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid #252a35;
+  font-size: 12px;
+  vertical-align: top;
+}
+
+.pbv-stage-table th {
+  color: #949ba4;
+  font-weight: 700;
+  background: #111318;
+}
+
+.pbv-stage-table td {
+  color: #f2f3f5;
+}
+
+.pbv-handoff-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pbv-handoff-row {
+  border: 1px solid #252a35;
+  border-radius: 12px;
+  background: #111318;
+  padding: 12px;
+}
+
+.pbv-handoff-status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  border: 1px solid #303644;
+  background: #171a21;
+  color: #d8dcff;
+  font-size: 12px;
+}
+
+.pbv-handoff-status.ready {
+  border-color: #2f6b4f;
+  color: #9df2c0;
+}
+
+.pbv-handoff-status.partial {
+  border-color: #725a2f;
+  color: #ffd28a;
+}
+
+.pbv-handoff-status.missing,
+.pbv-handoff-status.error {
+  border-color: #7c2b36;
+  color: #ffb3c1;
+}
+
+.pbv-warning {
+  margin-top: 14px;
+  border: 1px solid #7c2b36;
+  border-radius: 12px;
+  background: rgba(242, 63, 66, 0.08);
+  color: #ffb3c1;
+  padding: 12px;
+}
+
+.pbv-warning p {
+  margin: 0;
+}
+
+.pbv-copy-status {
+  margin: 12px 0 0;
+  color: #949ba4;
+  font-size: 13px;
+}
+
+.pbv-copy-status.success {
+  color: #9df2c0;
+}
+
+.pbv-copy-status.error {
+  color: #ffb3c1;
+}
+
 .timeline {
   display: grid;
   gap: 10px;
@@ -951,6 +1147,14 @@ pre {
 
   .summary-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .pbv-summary-grid {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+
+  .pbv-summary-grid.compact {
+    grid-template-columns: 1fr;
   }
 
   .topbar {

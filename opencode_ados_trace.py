@@ -93,7 +93,16 @@ def discover_skills() -> List[Dict[str, Any]]:
 
 def infer_ados_template_from_messages(
     messages: Optional[Iterable[Dict[str, Any]]],
+    selected_agent_override: Optional[str] = None,
 ) -> Dict[str, Any]:
+    override = str(selected_agent_override or "").strip()
+    if override in ADOS_ROLE_NAMES:
+        return {
+            "selected": override,
+            "source": "selected_agent_override",
+            "matched": override,
+        }
+
     joined = ""
 
     try:
@@ -299,15 +308,18 @@ def emit_ados_workflow_completed_events(
     *,
     status: str,
     duration_ms: Optional[int] = None,
+    completed_stages_override: Optional[Iterable[str]] = None,
+    failed_stages_override: Optional[Iterable[str]] = None,
+    skipped_stages_override: Optional[Iterable[str]] = None,
 ) -> None:
     workflow_id = workflow_info.get("workflow_id", "")
     workflow_mode = workflow_info.get("workflow_mode", "single_agent_unknown")
     selected_agent = workflow_info.get("selected_agent", "")
     active_stage = workflow_info.get("active_stage", "")
     stages = list(workflow_info.get("stages") or ADOS_STAGE_ORDER)
-    skipped_stages = [stage for stage in stages if stage != active_stage]
-    completed_stages = [active_stage] if active_stage and status == "completed" else []
-    failed_stages = [active_stage] if active_stage and status == "error" else []
+    skipped_stages = list(skipped_stages_override) if skipped_stages_override is not None else [stage for stage in stages if stage != active_stage]
+    completed_stages = list(completed_stages_override) if completed_stages_override is not None else ([active_stage] if active_stage and status == "completed" else [])
+    failed_stages = list(failed_stages_override) if failed_stages_override is not None else ([active_stage] if active_stage and status == "error" else [])
 
     _append_event_compat(
         append_event,
@@ -330,7 +342,7 @@ def emit_ados_workflow_completed_events(
         title="ADOS workflow completed",
         preview=(
             f"workflow={workflow_mode} status={status} "
-            f"completed={active_stage or 'unknown'} skipped={len(skipped_stages)}"
+            f"completed={','.join(completed_stages) or 'none'} skipped={len(skipped_stages)}"
         ),
         payload={
             "workflow_id": workflow_id,
@@ -454,8 +466,12 @@ def emit_ados_trace_events(
 
 def load_selected_ados_template(
     messages: Optional[Iterable[Dict[str, Any]]] = None,
+    selected_agent_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    selected = infer_ados_template_from_messages(messages)
+    selected = infer_ados_template_from_messages(
+        messages,
+        selected_agent_override=selected_agent_override,
+    )
     role_name = selected.get("selected") or "ados-builder"
 
     if role_name not in ADOS_ROLE_NAMES:
@@ -489,8 +505,12 @@ def load_selected_ados_template(
 
 def build_ados_template_instruction(
     messages: Optional[Iterable[Dict[str, Any]]] = None,
+    selected_agent_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    loaded = load_selected_ados_template(messages)
+    loaded = load_selected_ados_template(
+        messages,
+        selected_agent_override=selected_agent_override,
+    )
 
     role_name = loaded["selected"]
     template_path = loaded["template_path"]

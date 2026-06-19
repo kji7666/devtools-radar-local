@@ -91,6 +91,8 @@ def summarize_run_summary(summary: dict | None) -> dict:
         "selected_agent": summary.get("selected_agent"),
         "active_stage": summary.get("active_stage"),
         "workflow_status": summary.get("workflow_status"),
+        "completed_stages": list(summary.get("completed_stages") or []),
+        "failed_stages": list(summary.get("failed_stages") or []),
         "loaded_skills": list(summary.get("loaded_skills") or []),
         "tool_calls_count": int(summary.get("tool_calls_count") or 0),
         "mcp_internal_tool_calls": int(summary.get("mcp_internal_tool_calls") or 0),

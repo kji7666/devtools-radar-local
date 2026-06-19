@@ -14,6 +14,43 @@ const channels = [
 ];
 
 const expanded = new Set();
+let flowDigestFeedbackTimer = null;
+let pbvSummaryFeedbackTimer = null;
+
+const COMPACT_FLOW_EVENT_TYPES = new Set([
+  "model_request_received",
+  "opencode_request_received",
+  "opencode_ados_assets_detected",
+  "opencode_ados_template_selected",
+  "opencode_ados_template_loaded",
+  "opencode_ados_template_injected",
+  "opencode_skill_selection_completed",
+  "opencode_skill_loaded",
+  "opencode_skill_injected",
+  "opencode_ados_workflow_started",
+  "opencode_ados_stage_skipped",
+  "opencode_ados_stage_started",
+  "opencode_ados_stage_finished",
+  "opencode_ados_workflow_completed",
+  "opencode_ados_stage_model_call_started",
+  "opencode_ados_stage_model_call_finished",
+  "opencode_ados_stage_handoff_created",
+  "mcp_loop_started",
+  "mcp_loop_iteration_started",
+  "mcp_model_output_parsed",
+  "mcp_tool_calls_classified",
+  "mcp_tool_started",
+  "mcp_tool_finished",
+  "mcp_tool_error",
+  "mcp_loop_completed",
+  "opencode_changed_files_detected",
+  "opencode_diff_generated",
+  "opencode_validation_summary",
+  "opencode_run_summary_generated",
+  "model_response_sent",
+  "runner_error",
+  "model_response_error",
+]);
 
 const state = {
   viewMode: "channel",
@@ -53,6 +90,16 @@ const state = {
     loading: true,
     data: [],
     error: null,
+  },
+
+  flowDigest: {
+    copied: "",
+    error: "",
+  },
+
+  pbvSummary: {
+    copied: "",
+    error: "",
   },
 
   testPanel: {
@@ -512,8 +559,12 @@ function getRunSummaryData(event) {
   const payload = getInnerPayload(event);
   const changedFiles = toArray(payload.changed_files);
   const untrackedFiles = toArray(payload.untracked_files);
+  const completedStages = toArray(payload.completed_stages);
+  const failedStages = toArray(payload.failed_stages);
 
   return {
+    workflowMode: typeof payload.workflow_mode === "string" ? payload.workflow_mode : "",
+    activeStage: typeof payload.active_stage === "string" ? payload.active_stage : "",
     finalStatus: typeof payload.final_status === "string" ? payload.final_status : "unknown",
     filesChangedCount: Number.isFinite(Number(payload.files_changed_count))
       ? Number(payload.files_changed_count)
@@ -528,6 +579,8 @@ function getRunSummaryData(event) {
     durationMs: Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : null,
     changedFiles,
     untrackedFiles,
+    completedStages,
+    failedStages,
     runnerError: payload.runner_error ? String(payload.runner_error) : "",
   };
 }
@@ -933,6 +986,784 @@ function renderKeyValueRows(rows) {
         })
         .join("")}
     </div>
+  `;
+}
+
+function getFlowDigestScopeLabel(kind) {
+  if (kind === "visible") return "visible";
+  if (kind === "run") return "run";
+  return "compact";
+}
+
+function getFlowDigestRunLabel(events) {
+  if (state.selectedRunId && state.selectedRunId !== "latest") {
+    return state.selectedRunId;
+  }
+
+  const runId = events.find((event) => event.runId)?.runId;
+  return runId || "latest";
+}
+
+function getFlowDigestViewLabel() {
+  return state.viewMode === "history" ? "history" : "channel";
+}
+
+function getFlowDigestChannelLabel(kind) {
+  if (state.viewMode === "history") {
+    return kind === "visible" ? "history-filtered" : "all";
+  }
+
+  const currentChannel = channels.find((channel) => channel.id === state.channel);
+  return currentChannel?.id || state.channel || "all";
+}
+
+function getFlowDigestGeneratedAt() {
+  return new Date().toLocaleString("zh-TW", { hour12: false });
+}
+
+function getDigestEvents(kind) {
+  if (kind === "visible") {
+    return getDisplayedEvents();
+  }
+
+  const source = getChronologicalEvents();
+
+  if (kind === "compact") {
+    return source.filter((event) => isCompactFlowEvent(event));
+  }
+
+  return source;
+}
+
+function isCompactFlowEvent(event) {
+  const type = String(event?.type || "").toLowerCase();
+  const rawLevel = String(event?.rawLevel || "").toLowerCase();
+
+  return (
+    COMPACT_FLOW_EVENT_TYPES.has(type) ||
+    rawLevel === "error" ||
+    type.includes("error") ||
+    type.includes("workflow") ||
+    type.includes("stage") ||
+    type.includes("summary") ||
+    type.includes("diff") ||
+    type.includes("changed_files")
+  );
+}
+
+function formatDigestEvent(event, index) {
+  const duration = formatDuration(event.durationMs) || "-";
+  const status = event.status || "-";
+  const runId = event.runId || "-";
+  const summary = getEventSummaryText(event) || "-";
+
+  return [
+    `${index + 1}. [${event.time || "--:--:--"}] ${event.type || "unknown_event"}`,
+    `   title: ${event.title || "-"}`,
+    `   summary: ${summary}`,
+    `   source: ${event.source || "-"}`,
+    `   status: ${status}`,
+    `   duration: ${duration}`,
+    `   run_id: ${runId}`,
+  ].join("\n");
+}
+
+function buildQuickFlowSummary(events) {
+  const source = [...events];
+  const workflowStarted = [...source].reverse().find((event) => event.type === "opencode_ados_workflow_started");
+  const workflowCompleted = [...source].reverse().find((event) => event.type === "opencode_ados_workflow_completed");
+  const changedFiles = [...source].reverse().find((event) => event.type === "opencode_changed_files_detected");
+  const validation = [...source].reverse().find((event) => event.type === "opencode_validation_summary");
+  const runSummary = [...source].reverse().find((event) => event.type === "opencode_run_summary_generated");
+
+  const workflowStartedData = workflowStarted ? getAdosWorkflowData(workflowStarted) : null;
+  const workflowCompletedData = workflowCompleted ? getAdosWorkflowData(workflowCompleted) : null;
+  const changedFilesData = changedFiles ? getFileTraceData(changedFiles) : null;
+  const validationData = validation ? getValidationSummaryData(validation) : null;
+  const runSummaryData = runSummary ? getRunSummaryData(runSummary) : null;
+
+  const rows = [
+    { label: "workflow", value: workflowStartedData?.workflowMode || workflowCompletedData?.workflowMode || "" },
+    { label: "agent", value: workflowStartedData?.selectedAgent || workflowCompletedData?.selectedAgent || "" },
+    { label: "active_stage", value: workflowCompletedData?.activeStage || workflowStartedData?.activeStage || "" },
+    {
+      label: "completed_stages",
+      value: workflowCompletedData?.completedStages?.length ? workflowCompletedData.completedStages.join(", ") : "",
+    },
+    {
+      label: "skipped_stages",
+      value: workflowCompletedData?.skippedStages?.length ? workflowCompletedData.skippedStages.join(", ") : "",
+    },
+    {
+      label: "changed_files",
+      value: changedFilesData
+        ? `${changedFilesData.changedFilesCount}${changedFilesData.untrackedFilesCount ? ` (untracked=${changedFilesData.untrackedFilesCount})` : ""}`
+        : runSummaryData && Number.isFinite(runSummaryData.filesChangedCount)
+          ? `${runSummaryData.filesChangedCount}${runSummaryData.untrackedFilesCount ? ` (untracked=${runSummaryData.untrackedFilesCount})` : ""}`
+          : "",
+    },
+    { label: "validation_result", value: validationData?.validationResult || runSummaryData?.validationResult || "" },
+    { label: "final_status", value: runSummaryData?.finalStatus || workflowCompletedData?.status || "" },
+  ].filter((row) => row.value);
+
+  if (!rows.length) {
+    return "";
+  }
+
+  return [
+    "## Quick Summary",
+    "",
+    ...rows.map((row) => `- ${row.label}: ${row.value}`),
+    "",
+  ].join("\n");
+}
+
+function buildFlowDigest(events, options = {}) {
+  const kind = options.kind || "visible";
+  const lines = [
+    "# Runtime Flow Digest",
+    "",
+    `Scope: ${getFlowDigestScopeLabel(kind)}`,
+    `Run: ${getFlowDigestRunLabel(events)}`,
+    `View: ${getFlowDigestViewLabel()}`,
+    `Channel: ${getFlowDigestChannelLabel(kind)}`,
+    `Sort: ${state.sortDirection}`,
+    `Events: ${events.length}`,
+    `Generated: ${getFlowDigestGeneratedAt()}`,
+    "",
+  ];
+  const quickSummary = buildQuickFlowSummary(events);
+
+  if (quickSummary) {
+    lines.push(quickSummary);
+  }
+
+  lines.push("## Timeline Cards", "");
+
+  if (!events.length) {
+    lines.push("No events available.");
+    return lines.join("\n");
+  }
+
+  lines.push(...events.map((event, index) => formatDigestEvent(event, index)));
+  return lines.join("\n\n");
+}
+
+async function writeTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  const succeeded = document.execCommand("copy");
+  textarea.remove();
+
+  if (!succeeded) {
+    throw new Error("Clipboard copy failed");
+  }
+}
+
+function setFlowDigestFeedback({ copied = "", error = "" }) {
+  state.flowDigest.copied = copied;
+  state.flowDigest.error = error;
+
+  if (flowDigestFeedbackTimer) {
+    clearTimeout(flowDigestFeedbackTimer);
+    flowDigestFeedbackTimer = null;
+  }
+
+  if (copied || error) {
+    flowDigestFeedbackTimer = setTimeout(() => {
+      state.flowDigest.copied = "";
+      state.flowDigest.error = "";
+      renderPreservingScroll();
+    }, 1800);
+  }
+}
+
+async function copyFlowDigest(kind) {
+  const events = getDigestEvents(kind);
+  const text = buildFlowDigest(events, { kind });
+
+  try {
+    await writeTextToClipboard(text);
+    setFlowDigestFeedback({
+      copied:
+        kind === "visible"
+          ? "Copied visible timeline cards."
+          : kind === "run"
+            ? "Copied current run events."
+            : "Copied compact flow digest.",
+      error: "",
+    });
+  } catch (error) {
+    setFlowDigestFeedback({
+      copied: "",
+      error: error instanceof Error ? error.message : "Copy failed",
+    });
+  }
+
+  renderPreservingScroll();
+}
+
+function renderFlowDigestPanel() {
+  const statusText = state.flowDigest.error || state.flowDigest.copied;
+  const statusClass = state.flowDigest.error ? "error" : state.flowDigest.copied ? "success" : "";
+
+  return `
+    <section class="flow-digest-card">
+      <div class="flow-digest-head">
+        <div>
+          <h2>Flow Digest</h2>
+          <p class="muted">Copy timeline card titles and summaries as Markdown so the current runtime flow can be reviewed elsewhere without screenshots.</p>
+        </div>
+      </div>
+
+      <div class="flow-digest-actions">
+        <button class="mini-button copy-button" data-copy-flow-digest="visible">Copy Visible</button>
+        <button class="mini-button copy-button" data-copy-flow-digest="run">Copy Run</button>
+        <button class="mini-button copy-button" data-copy-flow-digest="compact">Copy Compact Flow</button>
+      </div>
+
+      ${
+        statusText
+          ? `<p class="flow-digest-status ${escapeHtml(statusClass)}">${escapeHtml(statusText)}</p>`
+          : `<p class="flow-digest-status">Visible uses current filters. Run uses the selected source. Compact keeps key workflow-check events only.</p>`
+      }
+    </section>
+  `;
+}
+
+function getPbvStageDisplayName(stage) {
+  if (stage === "planner") return "Plan";
+  if (stage === "builder") return "Build";
+  if (stage === "verifier") return "Verify";
+  return stage || "Unknown";
+}
+
+function extractStageOutputLength(payload, stage) {
+  if (!payload || !stage) {
+    return null;
+  }
+
+  const directValue = payload[`${stage}_output_length`];
+  const numericValue = Number(directValue);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function getToolNameFromEvent(event) {
+  const payload = getInnerPayload(event);
+  return firstNonEmpty(
+    payload.tool_name,
+    payload.tool_call?.name,
+    payload.tool_call?.tool_name,
+    payload.tool?.name
+  );
+}
+
+function getContentLengthFromEvent(event) {
+  const payload = getInnerPayload(event);
+  const value = Number(payload.content_length);
+  return Number.isFinite(value) ? value : null;
+}
+
+function getPbvEvents() {
+  return getChronologicalEvents();
+}
+
+function getChangedFilesSummary(events) {
+  const changedEvent = [...events].reverse().find((event) => event.type === "opencode_changed_files_detected");
+  const diffEvent = [...events].reverse().find((event) => event.type === "opencode_diff_generated");
+  const runSummaryEvent = [...events].reverse().find((event) => event.type === "opencode_run_summary_generated");
+  const changedData = changedEvent ? getFileTraceData(changedEvent) : null;
+  const diffData = diffEvent ? getFileTraceData(diffEvent) : null;
+  const runSummaryData = runSummaryEvent ? getRunSummaryData(runSummaryEvent) : null;
+
+  return {
+    changedFilesCount: changedData?.changedFilesCount ?? runSummaryData?.filesChangedCount ?? 0,
+    untrackedFilesCount: changedData?.untrackedFilesCount ?? runSummaryData?.untrackedFilesCount ?? 0,
+    changedFiles: changedData?.changedFiles ?? runSummaryData?.changedFiles ?? [],
+    untrackedFiles: changedData?.untrackedFiles ?? runSummaryData?.untrackedFiles ?? [],
+    diffPreviewLength: diffData?.diffPreviewLength ?? 0,
+  };
+}
+
+function getValidationSummary(events) {
+  const validationEvent = [...events].reverse().find((event) => event.type === "opencode_validation_summary");
+  const runSummaryEvent = [...events].reverse().find((event) => event.type === "opencode_run_summary_generated");
+  const validationData = validationEvent ? getValidationSummaryData(validationEvent) : null;
+  const runSummaryData = runSummaryEvent ? getRunSummaryData(runSummaryEvent) : null;
+
+  return {
+    validationResult: validationData?.validationResult || runSummaryData?.validationResult || "unknown",
+    commandsRun: validationData?.commandsRun ?? runSummaryData?.commandsRun ?? 0,
+    testCommandsRun: validationData?.testCommandsRun ?? runSummaryData?.testCommandsRun ?? 0,
+  };
+}
+
+function getFinalResponseStatus(events) {
+  if ([...events].reverse().find((event) => event.type === "model_response_sent")) {
+    return "sent";
+  }
+
+  if ([...events].reverse().find((event) => event.type === "model_response_error")) {
+    return "error";
+  }
+
+  return "unknown";
+}
+
+function inferPbvStages(events) {
+  const orderedStages = ["planner", "builder", "verifier"];
+  const stageMap = new Map(
+    orderedStages.map((stage) => [
+      stage,
+      {
+        key: stage,
+        name: getPbvStageDisplayName(stage),
+        agent: "",
+        status: "unknown",
+        templateSelected: "",
+        toolCount: 0,
+        toolCounts: {},
+        mainTools: [],
+        outputLength: null,
+        durationMs: null,
+        events: [],
+      },
+    ])
+  );
+
+  let activeStage = null;
+
+  for (const event of [...events].sort((a, b) => String(a.payload?.ts || "").localeCompare(String(b.payload?.ts || "")))) {
+    if (event.type === "opencode_ados_stage_started") {
+      const details = getAdosWorkflowData(event);
+      const stageKey = details.stage || details.activeStage;
+
+      if (!stageMap.has(stageKey)) {
+        stageMap.set(stageKey, {
+          key: stageKey,
+          name: getPbvStageDisplayName(stageKey),
+          agent: "",
+          status: "unknown",
+          templateSelected: "",
+          toolCount: 0,
+          toolCounts: {},
+          mainTools: [],
+          outputLength: null,
+          durationMs: null,
+          events: [],
+        });
+      }
+
+      activeStage = stageKey;
+      const bucket = stageMap.get(stageKey);
+      bucket.agent = details.selectedAgent || details.agent || bucket.agent || "";
+      bucket.events.push(event);
+      continue;
+    }
+
+    if (event.type === "opencode_ados_workflow_completed") {
+      activeStage = null;
+    }
+
+    if (!activeStage || !stageMap.has(activeStage)) {
+      continue;
+    }
+
+    const bucket = stageMap.get(activeStage);
+    bucket.events.push(event);
+
+    if (event.type === "opencode_ados_template_loaded") {
+      const payload = getInnerPayload(event);
+      bucket.templateSelected = typeof payload.selected === "string" ? payload.selected : bucket.templateSelected;
+      continue;
+    }
+
+    if (event.type === "mcp_tool_started") {
+      const toolName = getToolNameFromEvent(event);
+      if (toolName) {
+        bucket.toolCount += 1;
+        bucket.toolCounts[toolName] = (bucket.toolCounts[toolName] || 0) + 1;
+      }
+      continue;
+    }
+
+    if (event.type === "mcp_model_output_parsed") {
+      const contentLength = getContentLengthFromEvent(event);
+      if (contentLength !== null) {
+        bucket.outputLength = contentLength;
+      }
+      continue;
+    }
+
+    if (event.type === "opencode_ados_stage_finished") {
+      const details = getAdosWorkflowData(event);
+      const payload = getInnerPayload(event);
+      bucket.status = details.status || bucket.status;
+      bucket.agent = details.selectedAgent || details.agent || bucket.agent || "";
+      bucket.durationMs = details.durationMs ?? bucket.durationMs;
+      const stageOutputLength = extractStageOutputLength(payload, activeStage);
+      if (stageOutputLength !== null) {
+        bucket.outputLength = stageOutputLength;
+      }
+    }
+  }
+
+  return orderedStages.map((stage) => {
+    const bucket = stageMap.get(stage);
+    const mainTools = Object.entries(bucket.toolCounts)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 3)
+      .map(([name, count]) => `${name} x${count}`);
+
+    return {
+      ...bucket,
+      mainTools,
+    };
+  });
+}
+
+function getLatestPbvWorkflowEvents(events) {
+  const workflowStarted = [...events].reverse().find((event) => {
+    if (!isAdosWorkflowStartedEvent(event) && !isRunSummaryEvent(event) && !isAdosWorkflowCompletedEvent(event)) {
+      return false;
+    }
+
+    const workflowData = isRunSummaryEvent(event) ? getRunSummaryData(event) : getAdosWorkflowData(event);
+    return workflowData.workflowMode === "plan_build_verify";
+  });
+  const workflowCompleted = [...events].reverse().find((event) => {
+    return event.type === "opencode_ados_workflow_completed" && getAdosWorkflowData(event).workflowMode === "plan_build_verify";
+  });
+  const runSummary = [...events].reverse().find((event) => {
+    return event.type === "opencode_run_summary_generated" && getRunSummaryData(event).workflowMode === "plan_build_verify";
+  });
+  return { workflowStarted, workflowCompleted, runSummary };
+}
+
+function getWorkflowSummaryMismatch(stages, events) {
+  const completedFromStages = stages
+    .filter((stage) => stage.status === "completed")
+    .map((stage) => stage.key);
+  const workflowCompletedEvent = [...events].reverse().find((event) => event.type === "opencode_ados_workflow_completed");
+
+  if (!workflowCompletedEvent || completedFromStages.length < 2) {
+    return "";
+  }
+
+  const summaryText = getEventSummaryText(workflowCompletedEvent);
+  const missingStages = completedFromStages.filter((stage) => !summaryText.includes(stage));
+
+  if (summaryText.includes("completed=planner") && missingStages.length) {
+    return "workflow_completed summary may be inconsistent with stage events";
+  }
+
+  return "";
+}
+
+function getPbvHandoffs(events, pbvSummary) {
+  const stages = pbvSummary?.stages || [];
+  const stageMap = new Map(stages.map((stage) => [stage.key, stage]));
+  const changedFiles = getChangedFilesSummary(events);
+  const validation = getValidationSummary(events);
+
+  const planner = stageMap.get("planner");
+  const builder = stageMap.get("builder");
+  const verifier = stageMap.get("verifier");
+
+  const plannerToBuilderStatus = !planner
+    ? "unknown"
+    : planner.status === "completed" && builder?.events?.length
+      ? "ready"
+      : planner.status === "partial" && builder?.events?.length
+        ? "partial"
+        : (planner.status === "completed" || planner.status === "partial") && !builder?.events?.length
+          ? "missing"
+          : "unknown";
+
+  const builderToVerifierStatus = !builder
+    ? "unknown"
+    : builder.status === "completed" && verifier?.events?.length
+      ? "ready"
+      : builder.status === "partial" && verifier?.events?.length
+        ? "partial"
+        : (builder.status === "completed" || builder.status === "partial") && !verifier?.events?.length
+          ? "missing"
+          : "unknown";
+
+  return [
+    {
+      id: "planner-builder",
+      title: "Planner -> Builder",
+      status: plannerToBuilderStatus,
+      rows: [
+        { label: "planner status", value: planner?.status || "unknown" },
+        { label: "planner output", value: planner?.outputLength !== null ? `${planner.outputLength} chars` : "-" },
+        { label: "builder received stage", value: builder?.events?.length ? "yes" : "no" },
+        { label: "builder agent", value: builder?.agent || "-" },
+      ],
+    },
+    {
+      id: "builder-verifier",
+      title: "Builder -> Verifier",
+      status: builderToVerifierStatus,
+      rows: [
+        { label: "builder status", value: builder?.status || "unknown" },
+        { label: "builder tools", value: builder?.mainTools?.join(", ") || "0" },
+        { label: "changed files", value: changedFiles.changedFilesCount },
+        { label: "diff preview", value: changedFiles.diffPreviewLength ? `${changedFiles.diffPreviewLength} chars` : "-" },
+        { label: "validation", value: validation.validationResult || "unknown" },
+        { label: "verifier received stage", value: verifier?.events?.length ? "yes" : "no" },
+        { label: "verifier agent", value: verifier?.agent || "-" },
+      ],
+    },
+  ];
+}
+
+function getPbvSummary(events) {
+  const workflowEvents = getLatestPbvWorkflowEvents(events);
+  const runSummaryData = workflowEvents.runSummary ? getRunSummaryData(workflowEvents.runSummary) : null;
+  const workflowStartedData = workflowEvents.workflowStarted && !isRunSummaryEvent(workflowEvents.workflowStarted)
+    ? getAdosWorkflowData(workflowEvents.workflowStarted)
+    : null;
+  const workflowCompletedData = workflowEvents.workflowCompleted ? getAdosWorkflowData(workflowEvents.workflowCompleted) : null;
+  const workflowMode = workflowStartedData?.workflowMode || workflowCompletedData?.workflowMode || workflowEvents.runSummary?.payload?.payload?.workflow_mode || "";
+
+  if (workflowMode !== "plan_build_verify") {
+    return null;
+  }
+
+  const stages = inferPbvStages(events);
+  const changedFiles = getChangedFilesSummary(events);
+  const validation = getValidationSummary(events);
+  const finalResponseStatus = getFinalResponseStatus(events);
+  const warnings = [];
+  const workflowMismatch = getWorkflowSummaryMismatch(stages, events);
+
+  if (workflowMismatch) {
+    warnings.push(workflowMismatch);
+  }
+
+  return {
+    workflow: workflowMode,
+    status: workflowCompletedData?.status || runSummaryData?.finalStatus || "unknown",
+    stages,
+    agents: stages.map((stage) => stage.agent).filter(Boolean),
+    changedFilesCount: changedFiles.changedFilesCount,
+    untrackedFilesCount: changedFiles.untrackedFilesCount,
+    changedFiles: changedFiles.changedFiles,
+    validationResult: validation.validationResult,
+    commandsRun: validation.commandsRun,
+    testCommandsRun: validation.testCommandsRun,
+    finalResponseStatus,
+    durationMs: runSummaryData?.durationMs ?? workflowCompletedData?.durationMs ?? null,
+    handoffs: [],
+    warnings,
+  };
+}
+
+function buildPbvSummaryMarkdown(summary) {
+  const warnings = summary.warnings?.length
+    ? summary.warnings.map((warning) => `- ${warning}`).join("\n")
+    : "- none";
+
+  return [
+    "# PBV Summary",
+    "",
+    `Workflow: ${summary.workflow || "unknown"}`,
+    `Status: ${summary.status || "unknown"}`,
+    `Changed files: ${summary.changedFilesCount ?? 0}`,
+    `Validation: ${summary.validationResult || "unknown"}`,
+    `Final response: ${summary.finalResponseStatus || "unknown"}`,
+    "",
+    "## Stages",
+    "",
+    "| Stage | Agent | Status | Tools | Output |",
+    "|---|---|---|---|---|",
+    ...summary.stages.map((stage) => {
+      return `| ${stage.name} | ${stage.agent || "-"} | ${stage.status || "unknown"} | ${stage.mainTools.join(", ") || "0"} | ${stage.outputLength !== null ? `${stage.outputLength} chars` : "-"} |`;
+    }),
+    "",
+    "## Handoffs",
+    "",
+    ...summary.handoffs.map((handoff) => `- ${handoff.title}: ${handoff.status}`),
+    "",
+    "## Warnings",
+    "",
+    warnings,
+  ].join("\n");
+}
+
+function setPbvSummaryFeedback({ copied = "", error = "" }) {
+  state.pbvSummary.copied = copied;
+  state.pbvSummary.error = error;
+
+  if (pbvSummaryFeedbackTimer) {
+    clearTimeout(pbvSummaryFeedbackTimer);
+    pbvSummaryFeedbackTimer = null;
+  }
+
+  if (copied || error) {
+    pbvSummaryFeedbackTimer = setTimeout(() => {
+      state.pbvSummary.copied = "";
+      state.pbvSummary.error = "";
+      renderPreservingScroll();
+    }, 1800);
+  }
+}
+
+async function copyPbvSummary() {
+  const summary = getPbvSummary(getPbvEvents());
+  if (!summary) {
+    setPbvSummaryFeedback({ copied: "", error: "No PBV summary available." });
+    renderPreservingScroll();
+    return;
+  }
+
+  summary.handoffs = getPbvHandoffs(getPbvEvents(), summary);
+  const text = buildPbvSummaryMarkdown(summary);
+
+  try {
+    await writeTextToClipboard(text);
+    setPbvSummaryFeedback({ copied: "Copied PBV summary.", error: "" });
+  } catch (error) {
+    setPbvSummaryFeedback({
+      copied: "",
+      error: error instanceof Error ? error.message : "Copy failed",
+    });
+  }
+
+  renderPreservingScroll();
+}
+
+function renderPbvHandoffPanel(summary) {
+  if (!summary?.handoffs?.length) {
+    return "";
+  }
+
+  return `
+    <section class="pbv-handoff-card">
+      <h3>PBV Handoff</h3>
+      <div class="pbv-handoff-list">
+        ${summary.handoffs
+          .map((handoff) => {
+            return `
+              <div class="pbv-handoff-row">
+                <div class="pbv-handoff-head">
+                  <strong>${escapeHtml(handoff.title)}</strong>
+                  <span class="pbv-handoff-status ${escapeHtml(handoff.status)}">${escapeHtml(handoff.status)}</span>
+                </div>
+                <div class="pbv-summary-grid compact">
+                  ${handoff.rows
+                    .map((row) => `<div><span>${escapeHtml(row.label)}</span><strong>${escapeHtml(row.value)}</strong></div>`)
+                    .join("")}
+                </div>
+              </div>
+            `;
+          })
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderPbvSummaryPanel() {
+  const summary = getPbvSummary(getPbvEvents());
+
+  if (!summary) {
+    return "";
+  }
+
+  summary.handoffs = getPbvHandoffs(getPbvEvents(), summary);
+  const statusText = state.pbvSummary.error || state.pbvSummary.copied;
+  const statusClass = state.pbvSummary.error ? "error" : state.pbvSummary.copied ? "success" : "";
+
+  return `
+    <section class="pbv-summary-card">
+      <div class="pbv-summary-header">
+        <div>
+          <h2>PBV Summary</h2>
+          <p class="muted">A compact frontend-only view of the plan -> build -> verify run, inferred from the current timeline order.</p>
+        </div>
+        <button class="mini-button copy-button" data-copy-pbv-summary>銴ˊ PBV 摘要</button>
+      </div>
+
+      <div class="pbv-summary-grid">
+        <div><span>Workflow</span><strong>${escapeHtml(summary.workflow || "-")}</strong></div>
+        <div><span>Status</span><strong>${escapeHtml(summary.status || "unknown")}</strong></div>
+        <div><span>Changed files</span><strong>${escapeHtml(summary.changedFilesCount)}</strong></div>
+        <div><span>Untracked files</span><strong>${escapeHtml(summary.untrackedFilesCount)}</strong></div>
+        <div><span>Validation</span><strong>${escapeHtml(summary.validationResult || "unknown")}</strong></div>
+        <div><span>Commands</span><strong>${escapeHtml(summary.commandsRun)}</strong></div>
+        <div><span>Tests</span><strong>${escapeHtml(summary.testCommandsRun)}</strong></div>
+        <div><span>Final response</span><strong>${escapeHtml(summary.finalResponseStatus || "unknown")}</strong></div>
+        <div><span>Duration</span><strong>${escapeHtml(formatDuration(summary.durationMs) || "-")}</strong></div>
+        <div><span>Agents</span><strong>${escapeHtml(summary.agents.join(" / ") || "-")}</strong></div>
+      </div>
+
+      <div class="pbv-stage-table-wrap">
+        <table class="pbv-stage-table">
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Agent</th>
+              <th>Status</th>
+              <th>Template</th>
+              <th>Tools</th>
+              <th>Main tools</th>
+              <th>Output</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${summary.stages
+              .map((stage) => {
+                return `
+                  <tr>
+                    <td>${escapeHtml(stage.name)}</td>
+                    <td>${escapeHtml(stage.agent || "-")}</td>
+                    <td>${escapeHtml(stage.status || "unknown")}</td>
+                    <td>${escapeHtml(stage.templateSelected || "-")}</td>
+                    <td>${escapeHtml(stage.toolCount)}</td>
+                    <td>${escapeHtml(stage.mainTools.join(", ") || "0")}</td>
+                    <td>${escapeHtml(stage.outputLength !== null ? `${stage.outputLength} chars` : "-")}</td>
+                    <td>${escapeHtml(formatDuration(stage.durationMs) || "-")}</td>
+                  </tr>
+                `;
+              })
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+
+      ${renderPbvHandoffPanel(summary)}
+
+      ${
+        summary.warnings.length
+          ? `
+            <div class="pbv-warning">
+              ${summary.warnings.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}
+            </div>
+          `
+          : ""
+      }
+
+      ${
+        statusText
+          ? `<p class="pbv-copy-status ${escapeHtml(statusClass)}">${escapeHtml(statusText)}</p>`
+          : `<p class="pbv-copy-status">Copy a compact Markdown PBV summary for planner/build/verifier handoffs and final status.</p>`
+      }
+    </section>
   `;
 }
 
@@ -1791,6 +2622,10 @@ function render() {
 
         ${renderRunSummary()}
 
+        ${renderPbvSummaryPanel()}
+
+        ${renderFlowDigestPanel()}
+
         <section class="timeline">
           ${renderTimeline()}
         </section>
@@ -1972,7 +2807,7 @@ function bindEvents() {
       const value = decodeURIComponent(button.dataset.copy || "");
 
       try {
-        await navigator.clipboard.writeText(value);
+        await writeTextToClipboard(value);
         const originalText = button.textContent;
         button.textContent = "已複製";
 
@@ -1987,6 +2822,18 @@ function bindEvents() {
         document.execCommand("copy");
         textarea.remove();
       }
+    });
+  });
+
+  document.querySelectorAll("[data-copy-flow-digest]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await copyFlowDigest(button.dataset.copyFlowDigest || "visible");
+    });
+  });
+
+  document.querySelectorAll("[data-copy-pbv-summary]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await copyPbvSummary();
     });
   });
 

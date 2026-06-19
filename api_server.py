@@ -100,6 +100,13 @@ DEFAULT_MODEL = "chatgpt-web-local"
 SERVER_VERSION = "0.7.0"
 MAX_TOOL_LOOPS = 5
 
+PLAN_BUILD_VERIFY_TRIGGER_PHRASES = [
+    "ados-workflow plan-build-verify",
+    "ados plan-build-verify",
+    "使用 ados plan-build-verify",
+    "使用 ados-workflow plan-build-verify",
+]
+
 runner_lock = asyncio.Lock()
 pending_mcp_calls: dict[str, dict[str, Any]] = {}
 
@@ -2840,12 +2847,18 @@ def build_run_summary_payload(
     else:
         final_status = "unknown"
 
+    workflow_status = str(runtime_state.get("workflow_status") or "")
+    if runtime_state.get("workflow_mode") == "plan_build_verify" and workflow_status in {"completed", "partial", "error"}:
+        final_status = workflow_status
+
     return {
         "run_id": run_id,
         "workflow_mode": runtime_state.get("workflow_mode", ""),
         "selected_agent": runtime_state.get("selected_agent", ""),
         "active_stage": runtime_state.get("active_stage", ""),
-        "workflow_status": final_status,
+        "workflow_status": workflow_status or final_status,
+        "completed_stages": list(runtime_state.get("completed_stages") or []),
+        "failed_stages": list(runtime_state.get("failed_stages") or []),
         "loaded_skills": list(runtime_state.get("loaded_skills") or []),
         "tool_calls_count": int(runtime_state.get("tool_calls_count") or 0),
         "mcp_internal_tool_calls": int(runtime_state.get("mcp_internal_tool_calls") or 0),
@@ -2863,6 +2876,397 @@ def build_run_summary_payload(
         "runner_error": runner_error,
         "model_response_sent": model_response_sent,
     }
+
+
+def detect_plan_build_verify_trigger(messages: list[dict[str, Any]] | list[ChatMessage] | None) -> bool:
+    joined = ""
+
+    for message in messages or []:
+        if isinstance(message, ChatMessage):
+            content = normalize_content(message.content)
+        elif isinstance(message, dict):
+            content = normalize_content(message.get("content"))
+        else:
+            content = str(message)
+
+        joined += "\n" + content
+
+    lowered = joined.lower()
+    return any(phrase in lowered for phrase in PLAN_BUILD_VERIFY_TRIGGER_PHRASES)
+
+
+def build_plan_build_verify_workflow_info() -> dict[str, Any]:
+    return {
+        "workflow_id": f"ados-workflow-{uuid.uuid4().hex[:12]}",
+        "workflow_mode": "plan_build_verify",
+        "selected_agent": "ados-workflow",
+        "active_stage": "planner",
+        "stages": ["planner", "builder", "verifier"],
+    }
+
+
+def build_stage_request(
+    req: ChatCompletionRequest,
+    *,
+    stage_agent: str,
+    stage_instruction: str,
+    context_blocks: Optional[list[str]] = None,
+) -> ChatCompletionRequest:
+    body = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    stage_messages = list(body.get("messages") or [])
+
+    stage_messages.append(
+        {
+            "role": "system",
+            "content": f"Use {stage_agent}.\n{stage_instruction}".strip(),
+        }
+    )
+
+    for block in context_blocks or []:
+        if not block:
+            continue
+        stage_messages.append(
+            {
+                "role": "user",
+                "content": block,
+            }
+        )
+
+    body["messages"] = stage_messages
+    return ChatCompletionRequest(**body)
+
+
+def extract_response_content_and_tool_calls(result: dict[str, Any]) -> tuple[str, int]:
+    if not isinstance(result, dict):
+        return str(result), 0
+
+    choices = result.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return "", 0
+
+    message = choices[0].get("message") or {}
+    content = normalize_content(message.get("content")) if isinstance(message, dict) else ""
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else []
+
+    return content.strip(), len(tool_calls or [])
+
+
+def merge_runtime_state(shared_state: dict[str, Any], stage_state: dict[str, Any]) -> None:
+    shared_state.setdefault("commands", []).extend(list(stage_state.get("commands") or []))
+    shared_state["tool_calls_count"] = int(shared_state.get("tool_calls_count") or 0) + int(stage_state.get("tool_calls_count") or 0)
+    shared_state["mcp_internal_tool_calls"] = int(shared_state.get("mcp_internal_tool_calls") or 0) + int(stage_state.get("mcp_internal_tool_calls") or 0)
+    shared_state["mcp_external_tool_calls"] = int(shared_state.get("mcp_external_tool_calls") or 0) + int(stage_state.get("mcp_external_tool_calls") or 0)
+
+    existing_skills = list(shared_state.get("loaded_skills") or [])
+    for skill in list(stage_state.get("loaded_skills") or []):
+        if skill not in existing_skills:
+            existing_skills.append(skill)
+    shared_state["loaded_skills"] = existing_skills
+
+
+def emit_plan_build_verify_workflow_started(workflow_info: dict[str, Any]) -> None:
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_workflow_started",
+        title="ADOS workflow started",
+        preview="workflow=plan_build_verify agent=ados-workflow stage=planner",
+        payload=workflow_info,
+    )
+
+
+def emit_plan_build_verify_stage_started(workflow_info: dict[str, Any], stage: str, agent: str) -> None:
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_stage_started",
+        title="ADOS stage started",
+        preview=f"stage={stage} agent={agent}",
+        payload={
+            "workflow_id": workflow_info.get("workflow_id"),
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "selected_agent": agent,
+            "workflow_selected_agent": workflow_info.get("selected_agent"),
+            "stage": stage,
+            "agent": agent,
+        },
+    )
+
+
+def emit_plan_build_verify_stage_finished(
+    workflow_info: dict[str, Any],
+    *,
+    stage: str,
+    agent: str,
+    status: str,
+    output_text: str = "",
+) -> None:
+    payload = {
+        "workflow_id": workflow_info.get("workflow_id"),
+        "workflow_mode": workflow_info.get("workflow_mode"),
+        "selected_agent": agent,
+        "workflow_selected_agent": workflow_info.get("selected_agent"),
+        "stage": stage,
+        "agent": agent,
+        "status": status,
+    }
+    if output_text:
+        payload.update(build_text_debug_fields(f"{stage}_output", output_text, limit=1000))
+
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_stage_finished",
+        title="ADOS stage finished",
+        preview=f"stage={stage} status={status}",
+        payload=payload,
+        status="error" if status == "error" else "success",
+    )
+
+
+def emit_plan_build_verify_workflow_completed(
+    workflow_info: dict[str, Any],
+    workflow_summary: dict[str, Any],
+    *,
+    duration_ms: int,
+) -> None:
+    completed_stages = list(workflow_summary.get("completed_stages") or [])
+    failed_stages = list(workflow_summary.get("failed_stages") or [])
+    skipped_stages = list(workflow_summary.get("skipped_stages") or [])
+    status = str(workflow_summary.get("workflow_status") or workflow_summary.get("final_status") or "unknown")
+
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_workflow_completed",
+        title="ADOS workflow completed",
+        preview=(
+            f"workflow={workflow_info.get('workflow_mode')} "
+            f"status={status} "
+            f"completed={','.join(completed_stages) or 'none'} "
+            f"skipped={len(skipped_stages)}"
+        ),
+        payload={
+            "workflow_id": workflow_info.get("workflow_id"),
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "selected_agent": workflow_info.get("selected_agent"),
+            "active_stage": workflow_summary.get("active_stage", ""),
+            "completed_stages": completed_stages,
+            "failed_stages": failed_stages,
+            "skipped_stages": skipped_stages,
+            "status": status,
+            "duration_ms": duration_ms,
+        },
+        status="error" if status == "error" else "success",
+        duration_ms=duration_ms,
+    )
+
+
+async def run_plan_build_verify_workflow(
+    req: ChatCompletionRequest,
+    runtime_state: dict[str, Any],
+    git_diff_baseline: dict[str, Any],
+) -> dict[str, Any]:
+    workflow_info = build_plan_build_verify_workflow_info()
+    runtime_state["workflow_mode"] = workflow_info["workflow_mode"]
+    runtime_state["selected_agent"] = workflow_info["selected_agent"]
+    runtime_state["active_stage"] = "planner"
+    runtime_state["workflow_info"] = workflow_info
+    runtime_state["completed_stages"] = []
+    runtime_state["failed_stages"] = []
+    runtime_state["skipped_stages"] = []
+    runtime_state["workflow_status"] = "unknown"
+
+    emit_plan_build_verify_workflow_started(workflow_info)
+
+    planner_instruction = (
+        "You are the planner stage.\n"
+        "Do not edit files.\n"
+        "Do not run destructive actions.\n"
+        "Return a concise plan with:\n"
+        "- goal\n"
+        "- files likely to change\n"
+        "- risks\n"
+        "- suggested verification"
+    )
+    builder_instruction = (
+        "You are the builder stage.\n"
+        "Use the planner output as guidance.\n"
+        "Implement only the required file changes.\n"
+        "Keep changes small and reviewable.\n"
+        "Do not claim validation passed unless a real validation command ran."
+    )
+    verifier_instruction = (
+        "You are the verifier stage.\n"
+        "Review the planner output, builder output, changed files, diff summary, and validation summary.\n"
+        "Do not modify files unless explicitly necessary to fix a verification-only issue.\n"
+        "Never claim tests passed unless an actual command/test event exists with exit_code=0.\n"
+        "If no validation command ran, report validation_result=not_run.\n"
+        "Return:\n"
+        "- files changed\n"
+        "- validation result\n"
+        "- risks\n"
+        "- whether the task appears complete"
+    )
+
+    planner_output = ""
+    builder_output = ""
+    verifier_output = ""
+
+    emit_plan_build_verify_stage_started(workflow_info, "planner", "ados-planner")
+    planner_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    planner_result = await run_chat_with_mcp_loop(
+        build_stage_request(req, stage_agent="ados-planner", stage_instruction=planner_instruction),
+        runtime_state=planner_state,
+        emit_workflow_events=False,
+        selected_agent_override="ados-planner",
+    )
+    merge_runtime_state(runtime_state, planner_state)
+
+    if isinstance(planner_result, dict) and "error" in planner_result:
+        runtime_state["failed_stages"] = ["planner"]
+        runtime_state["skipped_stages"] = ["builder", "verifier"]
+        runtime_state["active_stage"] = "planner"
+        runtime_state["workflow_status"] = "error"
+        emit_plan_build_verify_stage_finished(
+            workflow_info,
+            stage="planner",
+            agent="ados-planner",
+            status="error",
+            output_text=str(planner_result.get("error")),
+        )
+        return planner_result
+
+    planner_output, planner_tool_calls = extract_response_content_and_tool_calls(planner_result)
+    planner_status = "partial" if planner_tool_calls else "completed"
+    runtime_state["completed_stages"].append("planner")
+    emit_plan_build_verify_stage_finished(
+        workflow_info,
+        stage="planner",
+        agent="ados-planner",
+        status=planner_status,
+        output_text=planner_output,
+    )
+
+    runtime_state["active_stage"] = "builder"
+    emit_plan_build_verify_stage_started(workflow_info, "builder", "ados-builder")
+    builder_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    builder_result = await run_chat_with_mcp_loop(
+        build_stage_request(
+            req,
+            stage_agent="ados-builder",
+            stage_instruction=builder_instruction,
+            context_blocks=[f"Planner output:\n{planner_output}"],
+        ),
+        runtime_state=builder_state,
+        emit_workflow_events=False,
+        selected_agent_override="ados-builder",
+    )
+    merge_runtime_state(runtime_state, builder_state)
+
+    git_diff_after_builder = capture_git_diff_snapshot()
+    builder_delta = build_git_diff_delta(git_diff_baseline, git_diff_after_builder)
+
+    if isinstance(builder_result, dict) and "error" in builder_result:
+        builder_status = "partial" if builder_delta.get("changed_files") else "error"
+        runtime_state["failed_stages"].append("builder")
+        runtime_state["skipped_stages"] = ["verifier"]
+        runtime_state["active_stage"] = "builder"
+        runtime_state["workflow_status"] = builder_status
+        emit_plan_build_verify_stage_finished(
+            workflow_info,
+            stage="builder",
+            agent="ados-builder",
+            status=builder_status,
+            output_text=str(builder_result.get("error")),
+        )
+        return builder_result
+
+    builder_output, builder_tool_calls = extract_response_content_and_tool_calls(builder_result)
+    builder_status = "partial" if builder_tool_calls else "completed"
+    runtime_state["completed_stages"].append("builder")
+    emit_plan_build_verify_stage_finished(
+        workflow_info,
+        stage="builder",
+        agent="ados-builder",
+        status=builder_status,
+        output_text=builder_output,
+    )
+
+    validation_snapshot = build_validation_summary_payload(runtime_state)
+    runtime_state["active_stage"] = "verifier"
+    emit_plan_build_verify_stage_started(workflow_info, "verifier", "ados-verifier")
+    verifier_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    verifier_context = [
+        f"Planner output:\n{planner_output}",
+        f"Builder output:\n{builder_output or '(no textual builder output)'}",
+        "Changed files summary:\n"
+        + json.dumps(
+            {
+                "changed_files": builder_delta.get("changed_files") or [],
+                "untracked_files": builder_delta.get("untracked_files") or [],
+                "diff_preview": str(builder_delta.get('diff_preview') or '')[:2000],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "Validation summary:\n" + json.dumps(validation_snapshot, ensure_ascii=False, indent=2),
+    ]
+    verifier_result = await run_chat_with_mcp_loop(
+        build_stage_request(
+            req,
+            stage_agent="ados-verifier",
+            stage_instruction=verifier_instruction,
+            context_blocks=verifier_context,
+        ),
+        runtime_state=verifier_state,
+        emit_workflow_events=False,
+        selected_agent_override="ados-verifier",
+    )
+    merge_runtime_state(runtime_state, verifier_state)
+
+    if isinstance(verifier_result, dict) and "error" in verifier_result:
+        verifier_status = "partial" if builder_delta.get("changed_files") else "error"
+        runtime_state["failed_stages"].append("verifier")
+        runtime_state["active_stage"] = "verifier"
+        runtime_state["workflow_status"] = verifier_status
+        emit_plan_build_verify_stage_finished(
+            workflow_info,
+            stage="verifier",
+            agent="ados-verifier",
+            status=verifier_status,
+            output_text=str(verifier_result.get("error")),
+        )
+        return verifier_result
+
+    verifier_output, verifier_tool_calls = extract_response_content_and_tool_calls(verifier_result)
+    verifier_status = "partial" if verifier_tool_calls else "completed"
+    runtime_state["completed_stages"].append("verifier")
+    runtime_state["active_stage"] = "verifier"
+    runtime_state["workflow_status"] = "partial" if ("partial" in [planner_status, builder_status, verifier_status]) else "completed"
+    emit_plan_build_verify_stage_finished(
+        workflow_info,
+        stage="verifier",
+        agent="ados-verifier",
+        status=verifier_status,
+        output_text=verifier_output,
+    )
+
+    final_status = runtime_state.get("workflow_status") or "unknown"
+    final_content = (
+        "## Plan\n"
+        f"{planner_output or '(no planner output)'}\n\n"
+        "## Build\n"
+        f"{builder_output or '(no builder output)'}\n\n"
+        "## Verify\n"
+        f"{verifier_output or '(no verifier output)'}\n\n"
+        "## Final Status\n"
+        f"{final_status}"
+    )
+
+    return make_chat_response(
+        req=req,
+        content=final_content,
+        tool_calls=None,
+        prompt_text=final_content,
+        raw_output=final_content,
+    )
 
 def tool_call_name(tool_call: dict[str, Any]) -> str:
     fn = tool_call.get("function") or {}
@@ -2909,6 +3313,8 @@ def request_wants_mcp_tools(req: ChatCompletionRequest) -> bool:
 async def run_chat_with_mcp_loop(
     req: ChatCompletionRequest,
     runtime_state: Optional[dict[str, Any]] = None,
+    emit_workflow_events: bool = True,
+    selected_agent_override: Optional[str] = None,
 ) -> dict[str, Any]:
     loop_started_at = time.perf_counter()
     runtime_state = runtime_state if runtime_state is not None else {}
@@ -2926,7 +3332,10 @@ async def run_chat_with_mcp_loop(
     messages = [ChatMessage(**m.model_dump()) for m in req.messages]
     messages_for_ados = [m.model_dump() for m in messages]
 
-    ados_instruction_info = build_ados_template_instruction(messages_for_ados)
+    ados_instruction_info = build_ados_template_instruction(
+        messages_for_ados,
+        selected_agent_override=selected_agent_override,
+    )
     ados_instruction = ados_instruction_info.get("instruction", "")
     runtime_state["selected_agent"] = ados_instruction_info.get("selected", "")
     runtime_state["workflow_info"] = build_ados_workflow_info(runtime_state.get("selected_agent"))
@@ -2943,10 +3352,11 @@ async def run_chat_with_mcp_loop(
         ados_instruction_info,
     )
 
-    emit_ados_workflow_started_events(
-        safe_append_event,
-        runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
-    )
+    if emit_workflow_events:
+        emit_ados_workflow_started_events(
+            safe_append_event,
+            runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
+        )
 
     skill_instruction_info = build_selected_skill_instructions(
         messages_for_ados,
@@ -3002,7 +3412,7 @@ async def run_chat_with_mcp_loop(
 
         code, stdout, stderr, raw_output = await run_main_with_prompt(
             prompt_text,
-            timeout_seconds=300,
+            timeout_seconds=600,
         )
 
         if code != 0:
@@ -3860,6 +4270,7 @@ async def chat_completions(
     request_summary = summarize_chat_request(body)
     opencode_summary = summarize_opencode_request(body)
     context_files = opencode_summary.get("context_files") or []
+    use_plan_build_verify = detect_plan_build_verify_trigger(body.get("messages", []) if isinstance(body, dict) else [])
     runtime_state: dict[str, Any] = {
         "commands": [],
         "loaded_skills": [],
@@ -3867,6 +4278,10 @@ async def chat_completions(
         "workflow_mode": "",
         "active_stage": "",
         "workflow_info": {},
+        "completed_stages": [],
+        "failed_stages": [],
+        "skipped_stages": [],
+        "workflow_status": "unknown",
         "tool_calls_count": 0,
         "mcp_internal_tool_calls": 0,
         "mcp_external_tool_calls": 0,
@@ -3946,7 +4361,10 @@ async def chat_completions(
         cleanup_stale_runner_lock(max_age_seconds=900)
 
         async with runner_lock:
-            result = await run_chat_with_mcp_loop(req, runtime_state=runtime_state)
+            if use_plan_build_verify:
+                result = await run_plan_build_verify_workflow(req, runtime_state, git_diff_baseline)
+            else:
+                result = await run_chat_with_mcp_loop(req, runtime_state=runtime_state)
 
         safe_append_event(
             source="mcp-runtime",
@@ -4023,12 +4441,24 @@ async def chat_completions(
             duration_ms=duration_ms,
         )
 
-        emit_ados_workflow_completed_events(
-            safe_append_event,
-            runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
-            status=str(run_summary_payload.get("workflow_status") or run_summary_payload.get("final_status") or "unknown"),
-            duration_ms=duration_ms,
-        )
+        if use_plan_build_verify:
+            if run_summary_payload.get("workflow_status"):
+                runtime_state["workflow_status"] = run_summary_payload.get("workflow_status")
+            emit_plan_build_verify_workflow_completed(
+                runtime_state.get("workflow_info") or build_plan_build_verify_workflow_info(),
+                run_summary_payload,
+                duration_ms=duration_ms,
+            )
+        else:
+            emit_ados_workflow_completed_events(
+                safe_append_event,
+                runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
+                status=str(run_summary_payload.get("workflow_status") or run_summary_payload.get("final_status") or "unknown"),
+                duration_ms=duration_ms,
+                completed_stages_override=run_summary_payload.get("completed_stages"),
+                failed_stages_override=run_summary_payload.get("failed_stages"),
+                skipped_stages_override=runtime_state.get("skipped_stages"),
+            )
 
         if isinstance(result, dict) and "error" in result:
             safe_append_event(
