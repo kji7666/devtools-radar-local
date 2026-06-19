@@ -68,6 +68,84 @@ def summarize_diff_generated_snapshot(snapshot: dict | None) -> dict:
     }
 
 
+def summarize_validation_summary(summary: dict | None) -> dict:
+    summary = summary or {}
+    validation_signals = list(summary.get("validation_signals") or [])
+
+    return {
+        "commands_run": int(summary.get("commands_run") or 0),
+        "test_commands_run": int(summary.get("test_commands_run") or 0),
+        "passed_commands": int(summary.get("passed_commands") or 0),
+        "failed_commands": int(summary.get("failed_commands") or 0),
+        "validation_result": str(summary.get("validation_result") or "unknown"),
+        "validation_signals": validation_signals,
+    }
+
+
+def summarize_run_summary(summary: dict | None) -> dict:
+    summary = summary or {}
+
+    return {
+        "run_id": summary.get("run_id"),
+        "selected_agent": summary.get("selected_agent"),
+        "loaded_skills": list(summary.get("loaded_skills") or []),
+        "tool_calls_count": int(summary.get("tool_calls_count") or 0),
+        "mcp_internal_tool_calls": int(summary.get("mcp_internal_tool_calls") or 0),
+        "mcp_external_tool_calls": int(summary.get("mcp_external_tool_calls") or 0),
+        "files_changed_count": int(summary.get("files_changed_count") or 0),
+        "changed_files": list(summary.get("changed_files") or []),
+        "untracked_files_count": int(summary.get("untracked_files_count") or 0),
+        "untracked_files": list(summary.get("untracked_files") or []),
+        "diff_preview_length": int(summary.get("diff_preview_length") or 0),
+        "commands_run": int(summary.get("commands_run") or 0),
+        "test_commands_run": int(summary.get("test_commands_run") or 0),
+        "validation_result": str(summary.get("validation_result") or "unknown"),
+        "final_status": str(summary.get("final_status") or "unknown"),
+        "duration_ms": summary.get("duration_ms"),
+        "runner_error": summary.get("runner_error"),
+        "model_response_sent": bool(summary.get("model_response_sent")),
+    }
+
+
+def build_command_event_preview(payload: dict | None) -> str:
+    payload = payload or {}
+    command = str(payload.get("command") or "")[:120]
+    duration_ms = payload.get("duration_ms")
+    exit_code = payload.get("exit_code")
+
+    parts = []
+
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+
+    if duration_ms not in (None, ""):
+        parts.append(f"duration_ms={duration_ms}")
+
+    if command:
+        parts.append(f"command={command}")
+
+    return " ".join(parts) if parts else "command event"
+
+
+def build_validation_summary_preview(payload: dict | None) -> str:
+    payload = payload or {}
+    return (
+        f"validation={payload.get('validation_result', 'unknown')} "
+        f"commands={int(payload.get('commands_run') or 0)} "
+        f"tests={int(payload.get('test_commands_run') or 0)}"
+    )
+
+
+def build_run_summary_preview(payload: dict | None) -> str:
+    payload = payload or {}
+    return (
+        f"files_changed={int(payload.get('files_changed_count') or 0)} "
+        f"commands={int(payload.get('commands_run') or 0)} "
+        f"validation={payload.get('validation_result', 'unknown')} "
+        f"status={payload.get('final_status', 'unknown')}"
+    )
+
+
 def summarize_chat_request(body: dict) -> dict:
     messages = body.get("messages") or []
     tools = body.get("tools") or []

@@ -469,6 +469,35 @@ textarea {
   color: #f2f3f5;
 }
 
+.trace-metrics {
+  display: grid;
+  gap: 8px;
+}
+
+.trace-metric-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #252a35;
+}
+
+.trace-metric-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.trace-metric-row span {
+  color: #949ba4;
+  font-size: 12px;
+}
+
+.trace-metric-row strong {
+  color: #f2f3f5;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .trace-file-list {
   margin: 0;
   padding-left: 18px;

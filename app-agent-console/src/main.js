@@ -423,6 +423,18 @@ function isFileTraceEvent(event) {
   return event?.type === "opencode_changed_files_detected" || event?.type === "opencode_diff_generated";
 }
 
+function isValidationSummaryEvent(event) {
+  return event?.type === "opencode_validation_summary";
+}
+
+function isRunSummaryEvent(event) {
+  return event?.type === "opencode_run_summary_generated";
+}
+
+function isSummaryTraceEvent(event) {
+  return isFileTraceEvent(event) || isValidationSummaryEvent(event) || isRunSummaryEvent(event);
+}
+
 function getFileTraceData(event) {
   const payload = getInnerPayload(event);
   const changedFiles = toArray(payload.changed_files);
@@ -452,7 +464,55 @@ function getFileTraceData(event) {
   };
 }
 
+function getValidationSummaryData(event) {
+  const payload = getInnerPayload(event);
+  const validationSignals = toArray(payload.validation_signals);
+
+  return {
+    validationResult: typeof payload.validation_result === "string" ? payload.validation_result : "unknown",
+    commandsRun: Number.isFinite(Number(payload.commands_run)) ? Number(payload.commands_run) : 0,
+    testCommandsRun: Number.isFinite(Number(payload.test_commands_run)) ? Number(payload.test_commands_run) : 0,
+    passedCommands: Number.isFinite(Number(payload.passed_commands)) ? Number(payload.passed_commands) : 0,
+    failedCommands: Number.isFinite(Number(payload.failed_commands)) ? Number(payload.failed_commands) : 0,
+    validationSignals,
+  };
+}
+
+function getRunSummaryData(event) {
+  const payload = getInnerPayload(event);
+  const changedFiles = toArray(payload.changed_files);
+  const untrackedFiles = toArray(payload.untracked_files);
+
+  return {
+    finalStatus: typeof payload.final_status === "string" ? payload.final_status : "unknown",
+    filesChangedCount: Number.isFinite(Number(payload.files_changed_count))
+      ? Number(payload.files_changed_count)
+      : changedFiles.length,
+    untrackedFilesCount: Number.isFinite(Number(payload.untracked_files_count))
+      ? Number(payload.untracked_files_count)
+      : untrackedFiles.length,
+    commandsRun: Number.isFinite(Number(payload.commands_run)) ? Number(payload.commands_run) : 0,
+    testCommandsRun: Number.isFinite(Number(payload.test_commands_run)) ? Number(payload.test_commands_run) : 0,
+    validationResult: typeof payload.validation_result === "string" ? payload.validation_result : "unknown",
+    toolCallsCount: Number.isFinite(Number(payload.tool_calls_count)) ? Number(payload.tool_calls_count) : null,
+    durationMs: Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : null,
+    changedFiles,
+    untrackedFiles,
+    runnerError: payload.runner_error ? String(payload.runner_error) : "",
+  };
+}
+
 function getEventSummaryText(event) {
+  if (isValidationSummaryEvent(event)) {
+    const details = getValidationSummaryData(event);
+    return `validation=${details.validationResult} commands=${details.commandsRun} tests=${details.testCommandsRun}`;
+  }
+
+  if (isRunSummaryEvent(event)) {
+    const details = getRunSummaryData(event);
+    return `files_changed=${details.filesChangedCount} commands=${details.commandsRun} validation=${details.validationResult} status=${details.finalStatus}`;
+  }
+
   if (!isFileTraceEvent(event)) {
     return event.preview;
   }
@@ -481,6 +541,99 @@ function renderFileListBlock(title, items) {
       </ul>
     </section>
   `;
+}
+
+function renderSummaryMetricRows(rows) {
+  const safeRows = rows.filter((row) => row && row.value !== null && row.value !== undefined && String(row.value) !== "");
+
+  if (!safeRows.length) {
+    return "";
+  }
+
+  return `
+    <div class="trace-metrics">
+      ${safeRows
+        .map((row) => {
+          return `
+            <div class="trace-metric-row">
+              <span>${escapeHtml(row.label)}</span>
+              <strong>${escapeHtml(row.value)}</strong>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderValidationSummaryDetails(event) {
+  if (!isValidationSummaryEvent(event)) {
+    return "";
+  }
+
+  const details = getValidationSummaryData(event);
+
+  return `
+    <section class="trace-panel">
+      <section class="trace-block">
+        <h4>Validation Summary</h4>
+        ${renderSummaryMetricRows([
+          { label: "validation", value: details.validationResult },
+          { label: "commands", value: details.commandsRun },
+          { label: "tests", value: details.testCommandsRun },
+          { label: "passed", value: details.passedCommands },
+          { label: "failed", value: details.failedCommands },
+        ])}
+      </section>
+      ${renderFileListBlock("Validation signals", details.validationSignals)}
+    </section>
+  `;
+}
+
+function renderRunSummaryDetails(event) {
+  if (!isRunSummaryEvent(event)) {
+    return "";
+  }
+
+  const details = getRunSummaryData(event);
+  const durationText = details.durationMs !== null ? formatDuration(details.durationMs) : "";
+
+  return `
+    <section class="trace-panel">
+      <section class="trace-block">
+        <h4>Run Summary</h4>
+        ${renderSummaryMetricRows([
+          { label: "status", value: details.finalStatus },
+          { label: "files changed", value: details.filesChangedCount },
+          { label: "untracked", value: details.untrackedFilesCount },
+          { label: "commands", value: details.commandsRun },
+          { label: "tests", value: details.testCommandsRun },
+          { label: "validation", value: details.validationResult },
+          { label: "tool calls", value: details.toolCallsCount },
+          { label: "duration", value: durationText },
+        ])}
+      </section>
+      ${renderFileListBlock("Changed files", details.changedFiles)}
+      ${renderFileListBlock("Untracked files", details.untrackedFiles)}
+      ${details.runnerError ? renderTextBlock("Runner error", details.runnerError) : ""}
+    </section>
+  `;
+}
+
+function renderEventDetails(event) {
+  if (isFileTraceEvent(event)) {
+    return renderFileTraceDetails(event);
+  }
+
+  if (isValidationSummaryEvent(event)) {
+    return renderValidationSummaryDetails(event);
+  }
+
+  if (isRunSummaryEvent(event)) {
+    return renderRunSummaryDetails(event);
+  }
+
+  return "";
 }
 
 function renderFileTraceDetails(event) {
@@ -705,7 +858,7 @@ function renderInspectorOverview(event) {
     ])}
 
     <div class="full-block">${escapeHtml(event.full)}</div>
-    ${renderFileTraceDetails(event)}
+    ${renderEventDetails(event)}
   `;
 }
 
@@ -1248,7 +1401,7 @@ function renderTimeline() {
 
             <p>${escapeHtml(getEventSummaryText(event))}</p>
 
-            ${isExpanded ? `<div class="full-block">${escapeHtml(event.full)}</div>${renderFileTraceDetails(event)}` : ""}
+            ${isExpanded ? `<div class="full-block">${escapeHtml(event.full)}</div>${renderEventDetails(event)}` : ""}
 
             <div class="event-actions">
               <button class="mini-button" data-toggle="${escapeHtml(event.id)}">${isExpanded ? "收合" : "展開"}</button>

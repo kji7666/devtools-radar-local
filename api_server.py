@@ -55,12 +55,19 @@ from runtime_event_summarizer import (
     build_text_debug_fields,
     summarize_changed_files_snapshot,
     summarize_diff_generated_snapshot,
+    summarize_validation_summary,
+    summarize_run_summary,
+    build_command_event_preview,
+    build_validation_summary_preview,
+    build_run_summary_preview,
 )
 from runtime_lifecycle_summarizer import (
     summarize_opencode_request,
     summarize_mcp_tool_call,
     summarize_tool_result,
     summarize_loop_result,
+    detect_command_trace,
+    build_command_trace_payload,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2757,6 +2764,100 @@ def build_git_diff_delta(
         "untracked_files": untracked_files,
     }
 
+
+def build_validation_summary_payload(runtime_state: dict[str, Any] | None) -> dict[str, Any]:
+    runtime_state = runtime_state or {}
+    commands = list(runtime_state.get("commands") or [])
+    test_commands = [item for item in commands if item.get("is_test_command")]
+    passed_commands = sum(1 for item in commands if item.get("exit_code") == 0)
+    failed_commands = sum(1 for item in commands if item.get("exit_code") not in (None, 0))
+
+    if not test_commands:
+        validation_result = "not_run"
+    elif any(item.get("exit_code") not in (None, 0) for item in test_commands):
+        validation_result = "fail"
+    elif all(item.get("exit_code") == 0 for item in test_commands):
+        validation_result = "pass"
+    else:
+        validation_result = "unknown"
+
+    validation_signals: list[str] = []
+    if test_commands:
+        validation_signals.extend(
+            sorted(
+                {
+                    item.get("test_command_kind") or "test_command"
+                    for item in test_commands
+                }
+            )
+        )
+
+        if any(item.get("exit_code") is None for item in test_commands):
+            validation_signals.append("missing_exit_code")
+
+    return {
+        "commands_run": len(commands),
+        "test_commands_run": len(test_commands),
+        "passed_commands": passed_commands,
+        "failed_commands": failed_commands,
+        "validation_result": validation_result,
+        "validation_signals": validation_signals,
+    }
+
+
+def build_run_summary_payload(
+    *,
+    run_id: str,
+    runtime_state: dict[str, Any] | None,
+    git_diff_delta: dict[str, Any] | None,
+    validation_summary: dict[str, Any] | None,
+    result: Any,
+    duration_ms: int,
+) -> dict[str, Any]:
+    runtime_state = runtime_state or {}
+    git_diff_delta = git_diff_delta or {}
+    validation_summary = validation_summary or {}
+
+    changed_files = list(git_diff_delta.get("changed_files") or [])
+    untracked_files = list(git_diff_delta.get("untracked_files") or [])
+    runner_error = runtime_state.get("runner_error")
+
+    model_response_sent = bool(runtime_state.get("model_response_sent"))
+
+    if model_response_sent and not runner_error:
+        final_status = "completed"
+    elif runner_error and not model_response_sent:
+        final_status = "error"
+    elif (
+        runtime_state.get("tool_calls_count")
+        or changed_files
+        or runtime_state.get("commands")
+    ) and not model_response_sent:
+        final_status = "partial"
+    else:
+        final_status = "unknown"
+
+    return {
+        "run_id": run_id,
+        "selected_agent": runtime_state.get("selected_agent", ""),
+        "loaded_skills": list(runtime_state.get("loaded_skills") or []),
+        "tool_calls_count": int(runtime_state.get("tool_calls_count") or 0),
+        "mcp_internal_tool_calls": int(runtime_state.get("mcp_internal_tool_calls") or 0),
+        "mcp_external_tool_calls": int(runtime_state.get("mcp_external_tool_calls") or 0),
+        "files_changed_count": len(changed_files),
+        "changed_files": changed_files,
+        "untracked_files_count": len(untracked_files),
+        "untracked_files": untracked_files,
+        "diff_preview_length": len(str(git_diff_delta.get("diff_preview") or "")),
+        "commands_run": int(validation_summary.get("commands_run") or 0),
+        "test_commands_run": int(validation_summary.get("test_commands_run") or 0),
+        "validation_result": str(validation_summary.get("validation_result") or "unknown"),
+        "final_status": final_status,
+        "duration_ms": duration_ms,
+        "runner_error": runner_error,
+        "model_response_sent": model_response_sent,
+    }
+
 def tool_call_name(tool_call: dict[str, Any]) -> str:
     fn = tool_call.get("function") or {}
     return str(fn.get("name") or "")
@@ -2799,8 +2900,12 @@ def request_wants_mcp_tools(req: ChatCompletionRequest) -> bool:
     return True
 
 
-async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
+async def run_chat_with_mcp_loop(
+    req: ChatCompletionRequest,
+    runtime_state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     loop_started_at = time.perf_counter()
+    runtime_state = runtime_state if runtime_state is not None else {}
 
     safe_append_event(
         source="mcp-runtime",
@@ -2817,6 +2922,7 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
 
     ados_instruction_info = build_ados_template_instruction(messages_for_ados)
     ados_instruction = ados_instruction_info.get("instruction", "")
+    runtime_state["selected_agent"] = ados_instruction_info.get("selected", "")
 
     emit_ados_template_loaded_event(
         safe_append_event,
@@ -2833,6 +2939,7 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
         max_skills=2,
     )
     skill_instruction = skill_instruction_info.get("instruction", "")
+    runtime_state["loaded_skills"] = list(skill_instruction_info.get("selected_skill_names") or [])
 
     emit_opencode_skill_trace_events(
         safe_append_event,
@@ -2959,6 +3066,10 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
             },
         )
 
+        runtime_state["mcp_internal_tool_calls"] = int(runtime_state.get("mcp_internal_tool_calls") or 0) + len(executable_calls)
+        runtime_state["mcp_external_tool_calls"] = int(runtime_state.get("mcp_external_tool_calls") or 0) + len(external_calls)
+        runtime_state["tool_calls_count"] = int(runtime_state.get("tool_calls_count") or 0) + len(executable_calls) + len(external_calls)
+
         # OpenCode native tools, such as read/edit/bash, must be returned to
         # OpenCode as assistant.tool_calls. Do not execute them inside this API.
         if external_calls and not executable_calls:
@@ -2987,6 +3098,8 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
             name = tool_call_name(call)
             args = tool_call_arguments(call)
             tool_started_at = time.perf_counter()
+            command_info = detect_command_trace(name, args)
+            command_started_at = datetime.now().isoformat()
 
             safe_append_event(
                 source="mcp-runtime",
@@ -2999,9 +3112,33 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
                 },
             )
 
+            if command_info:
+                command_started_payload = build_command_trace_payload(
+                    command_info,
+                    started_at=command_started_at,
+                    finished_at="",
+                    duration_ms=None,
+                    result_text="",
+                    error_text="",
+                )
+                command_started_event_type = (
+                    "opencode_test_started"
+                    if command_info.get("is_test_command")
+                    else "opencode_command_started"
+                )
+
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type=command_started_event_type,
+                    title="Test started" if command_info.get("is_test_command") else "Command started",
+                    preview=build_command_event_preview(command_started_payload),
+                    payload=command_started_payload,
+                )
+
             try:
                 result_text = await mcp_manager.call_tool(name, args)
                 tool_duration_ms = int((time.perf_counter() - tool_started_at) * 1000)
+                command_finished_at = datetime.now().isoformat()
 
                 safe_append_event(
                     source="mcp-runtime",
@@ -3015,8 +3152,35 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
                     duration_ms=tool_duration_ms,
                 )
 
+                if command_info:
+                    command_finished_payload = build_command_trace_payload(
+                        command_info,
+                        started_at=command_started_at,
+                        finished_at=command_finished_at,
+                        duration_ms=tool_duration_ms,
+                        result_text=result_text,
+                        error_text="",
+                    )
+                    command_finished_event_type = (
+                        "opencode_test_finished"
+                        if command_info.get("is_test_command")
+                        else "opencode_command_finished"
+                    )
+
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type=command_finished_event_type,
+                        title="Test finished" if command_info.get("is_test_command") else "Command finished",
+                        preview=build_command_event_preview(command_finished_payload),
+                        payload=command_finished_payload,
+                        duration_ms=tool_duration_ms,
+                    )
+
+                    runtime_state.setdefault("commands", []).append(command_finished_payload)
+
             except Exception as error:
                 tool_duration_ms = int((time.perf_counter() - tool_started_at) * 1000)
+                command_finished_at = datetime.now().isoformat()
 
                 safe_append_event(
                     source="mcp-runtime",
@@ -3032,6 +3196,33 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
                     status="error",
                     duration_ms=tool_duration_ms,
                 )
+
+                if command_info:
+                    command_finished_payload = build_command_trace_payload(
+                        command_info,
+                        started_at=command_started_at,
+                        finished_at=command_finished_at,
+                        duration_ms=tool_duration_ms,
+                        result_text="",
+                        error_text=f"{type(error).__name__}: {error}",
+                    )
+                    command_finished_event_type = (
+                        "opencode_test_finished"
+                        if command_info.get("is_test_command")
+                        else "opencode_command_finished"
+                    )
+
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type=command_finished_event_type,
+                        title="Test finished" if command_info.get("is_test_command") else "Command finished",
+                        preview=build_command_event_preview(command_finished_payload),
+                        payload=command_finished_payload,
+                        status="error",
+                        duration_ms=tool_duration_ms,
+                    )
+
+                    runtime_state.setdefault("commands", []).append(command_finished_payload)
 
                 result_text = f"[MCP_TOOL_ERROR]\n{name}\n{type(error).__name__}: {error}"
 
@@ -3655,6 +3846,16 @@ async def chat_completions(
     request_summary = summarize_chat_request(body)
     opencode_summary = summarize_opencode_request(body)
     context_files = opencode_summary.get("context_files") or []
+    runtime_state: dict[str, Any] = {
+        "commands": [],
+        "loaded_skills": [],
+        "selected_agent": "",
+        "tool_calls_count": 0,
+        "mcp_internal_tool_calls": 0,
+        "mcp_external_tool_calls": 0,
+        "runner_error": None,
+        "model_response_sent": False,
+    }
 
     safe_append_event(
         source="devtools-radar-api",
@@ -3728,7 +3929,7 @@ async def chat_completions(
         cleanup_stale_runner_lock(max_age_seconds=900)
 
         async with runner_lock:
-            result = await run_chat_with_mcp_loop(req)
+            result = await run_chat_with_mcp_loop(req, runtime_state=runtime_state)
 
         safe_append_event(
             source="mcp-runtime",
@@ -3765,6 +3966,43 @@ async def chat_completions(
                 f"diff_preview_length={len(git_diff_delta.get('diff_preview') or '')}"
             ),
             payload=summarize_diff_generated_snapshot(git_diff_delta),
+            duration_ms=duration_ms,
+        )
+
+        if isinstance(result, dict) and "error" in result:
+            runtime_state["runner_error"] = result.get("error")
+        else:
+            runtime_state["runner_error"] = None
+
+        validation_summary_payload = summarize_validation_summary(
+            build_validation_summary_payload(runtime_state)
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_validation_summary",
+            title="Validation summary",
+            preview=build_validation_summary_preview(validation_summary_payload),
+            payload=validation_summary_payload,
+            duration_ms=duration_ms,
+        )
+
+        runtime_state["model_response_sent"] = not (isinstance(result, dict) and "error" in result)
+        run_summary_payload = summarize_run_summary(
+            build_run_summary_payload(
+                run_id=run_id,
+                runtime_state=runtime_state,
+                git_diff_delta=git_diff_delta,
+                validation_summary=validation_summary_payload,
+                result=result,
+                duration_ms=duration_ms,
+            )
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_run_summary_generated",
+            title="OpenCode run summary",
+            preview=build_run_summary_preview(run_summary_payload),
+            payload=run_summary_payload,
             duration_ms=duration_ms,
         )
 
