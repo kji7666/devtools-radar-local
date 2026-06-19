@@ -415,6 +415,110 @@ function getToolResult(event) {
   );
 }
 
+function toArray(value) {
+  return Array.isArray(value) ? value.filter((item) => item !== null && item !== undefined && String(item) !== "") : [];
+}
+
+function isFileTraceEvent(event) {
+  return event?.type === "opencode_changed_files_detected" || event?.type === "opencode_diff_generated";
+}
+
+function getFileTraceData(event) {
+  const payload = getInnerPayload(event);
+  const changedFiles = toArray(payload.changed_files);
+  const untrackedFiles = toArray(payload.untracked_files);
+  const changedFilesCount = Number.isFinite(Number(payload.changed_files_count))
+    ? Number(payload.changed_files_count)
+    : changedFiles.length;
+  const untrackedFilesCount = Number.isFinite(Number(payload.untracked_files_count))
+    ? Number(payload.untracked_files_count)
+    : untrackedFiles.length;
+  const additions = Number.isFinite(Number(payload.additions)) ? Number(payload.additions) : 0;
+  const deletions = Number.isFinite(Number(payload.deletions)) ? Number(payload.deletions) : 0;
+  const diffPreview = typeof payload.diff_preview === "string" ? payload.diff_preview : "";
+  const diffPreviewLength = Number.isFinite(Number(payload.diff_preview_length))
+    ? Number(payload.diff_preview_length)
+    : diffPreview.length;
+
+  return {
+    changedFiles,
+    changedFilesCount,
+    untrackedFiles,
+    untrackedFilesCount,
+    additions,
+    deletions,
+    diffPreview,
+    diffPreviewLength,
+  };
+}
+
+function getEventSummaryText(event) {
+  if (!isFileTraceEvent(event)) {
+    return event.preview;
+  }
+
+  const details = getFileTraceData(event);
+
+  if (event.type === "opencode_diff_generated") {
+    return `changed_files=${details.changedFilesCount} untracked=${details.untrackedFilesCount} diff_preview_length=${details.diffPreviewLength}`;
+  }
+
+  return `changed_files=${details.changedFilesCount} untracked=${details.untrackedFilesCount} additions=${details.additions} deletions=${details.deletions}`;
+}
+
+function renderFileListBlock(title, items) {
+  const rows = toArray(items);
+
+  if (!rows.length) {
+    return "";
+  }
+
+  return `
+    <section class="trace-block">
+      <h4>${escapeHtml(title)}</h4>
+      <ul class="trace-file-list">
+        ${rows.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+      </ul>
+    </section>
+  `;
+}
+
+function renderFileTraceDetails(event) {
+  if (!isFileTraceEvent(event)) {
+    return "";
+  }
+
+  const details = getFileTraceData(event);
+
+  return `
+    <section class="trace-panel">
+      <div class="trace-summary">
+        <span>changed_files=${escapeHtml(details.changedFilesCount)}</span>
+        <span>untracked=${escapeHtml(details.untrackedFilesCount)}</span>
+        <span>additions=${escapeHtml(details.additions)}</span>
+        <span>deletions=${escapeHtml(details.deletions)}</span>
+        ${
+          event.type === "opencode_diff_generated"
+            ? `<span>diff_preview_length=${escapeHtml(details.diffPreviewLength)}</span>`
+            : ""
+        }
+      </div>
+      ${renderFileListBlock("Changed files", details.changedFiles)}
+      ${renderFileListBlock("Untracked files", details.untrackedFiles)}
+      ${
+        details.diffPreview
+          ? `
+            <section class="trace-block">
+              <h4>Diff preview</h4>
+              <pre class="trace-preview">${escapeHtml(details.diffPreview)}</pre>
+            </section>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
 function renderCopyButton(label, value, extraClass = "") {
   const encoded = encodeURIComponent(String(value ?? ""));
 
@@ -601,6 +705,7 @@ function renderInspectorOverview(event) {
     ])}
 
     <div class="full-block">${escapeHtml(event.full)}</div>
+    ${renderFileTraceDetails(event)}
   `;
 }
 
@@ -1141,9 +1246,9 @@ function renderTimeline() {
               <h3>${escapeHtml(event.title)}</h3>
             </div>
 
-            <p>${escapeHtml(event.preview)}</p>
+            <p>${escapeHtml(getEventSummaryText(event))}</p>
 
-            ${isExpanded ? `<div class="full-block">${escapeHtml(event.full)}</div>` : ""}
+            ${isExpanded ? `<div class="full-block">${escapeHtml(event.full)}</div>${renderFileTraceDetails(event)}` : ""}
 
             <div class="event-actions">
               <button class="mini-button" data-toggle="${escapeHtml(event.id)}">${isExpanded ? "收合" : "展開"}</button>

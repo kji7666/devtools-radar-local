@@ -434,6 +434,57 @@ textarea {
   line-height: 1.45;
 }
 
+.trace-panel {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0 0;
+}
+
+.trace-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trace-summary span {
+  border: 1px solid #303644;
+  border-radius: 999px;
+  background: #111318;
+  color: #d8dcff;
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.trace-block {
+  border: 1px solid #2b2f3a;
+  border-radius: 12px;
+  background: #111318;
+  padding: 10px 12px;
+}
+
+.trace-block h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #f2f3f5;
+}
+
+.trace-file-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #c6cbd2;
+}
+
+.trace-file-list li {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.trace-preview {
+  margin: 0;
+  max-height: 260px;
+}
+
 .event-actions {
   display: flex;
   flex-wrap: wrap;

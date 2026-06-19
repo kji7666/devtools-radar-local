@@ -124,13 +124,162 @@ def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def get_cdp_port(config: dict) -> int:
+    cdp_url = str(config.get("cdp_url", "http://127.0.0.1:9222"))
+
+    try:
+        return int(cdp_url.rsplit(":", 1)[1].rstrip("/"))
+    except Exception:
+        return 9222
+
+
+def find_pids_listening_on_port(port: int) -> set[int]:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        logging.exception("查詢 CDP port PID 失敗")
+        return set()
+
+    pids: set[int] = set()
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+
+        proto, local_address, _, state, pid_text = parts[:5]
+        if proto.upper() != "TCP" or state.upper() != "LISTENING":
+            continue
+
+        if not local_address.endswith(f":{port}"):
+            continue
+
+        try:
+            pids.add(int(pid_text))
+        except Exception:
+            continue
+
+    return pids
+
+
+def find_edge_pids_for_profile(profile_dir: str) -> set[int]:
+    escaped_profile = str(profile_dir).replace("'", "''")
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name = 'msedge.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{escaped_profile}*' }} | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        logging.exception("查詢 Edge profile PID 失敗")
+        return set()
+
+    if result.returncode != 0:
+        logging.warning("查詢 Edge profile PID 失敗: %s", (result.stderr or result.stdout or "").strip())
+        return set()
+
+    pids: set[int] = set()
+
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+
+        try:
+            pids.add(int(text))
+        except Exception:
+            continue
+
+    return pids
+
+
+def stop_process_tree(pid: int) -> bool:
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        logging.exception("停止 PID %s 失敗", pid)
+        return False
+
+    if result.returncode == 0:
+        logging.info("已停止 stale Edge debug PID=%s", pid)
+        return True
+
+    logging.warning(
+        "停止 PID %s 失敗: %s",
+        pid,
+        (result.stderr or result.stdout or f"code={result.returncode}").strip(),
+    )
+    return False
+
+
+def stop_stale_edge_debug_session(config: dict) -> None:
+    cdp_port = get_cdp_port(config)
+    profile_dir = str(config.get("edge_profile_dir", str(BASE_DIR / "edge_debug_profile")))
+
+    logging.info("restart_edge_debug_session enabled")
+    logging.info("checking existing CDP port %s", cdp_port)
+
+    port_pids = find_pids_listening_on_port(cdp_port)
+    profile_pids = find_edge_pids_for_profile(profile_dir)
+    candidate_pids = port_pids | profile_pids
+
+    if not candidate_pids:
+        logging.info("沒有找到需要停止的 stale Edge debug session")
+        return
+
+    logging.info(
+        "stopping stale Edge debug session: port_pids=%s profile_pids=%s",
+        sorted(port_pids),
+        sorted(profile_pids),
+    )
+
+    for pid in sorted(candidate_pids):
+        stop_process_tree(pid)
+
+    for _ in range(20):
+        if not is_port_open("127.0.0.1", cdp_port):
+            logging.info("CDP port %s 已關閉", cdp_port)
+            return
+        time.sleep(0.5)
+
+    logging.warning("CDP port %s 仍然開啟，可能仍有外部 Edge session 存活", cdp_port)
+
+
 def start_edge_if_needed(config: dict) -> None:
     if not bool(config.get("auto_start_edge", True)):
         logging.info("auto_start_edge=false，不自動啟動 Edge")
         return
 
-    if is_port_open("127.0.0.1", 9222):
-        logging.info("偵測到 9222 已開啟，略過啟動 Edge")
+    cdp_port = get_cdp_port(config)
+    restart_debug_session = bool(config.get("restart_edge_debug_session", True))
+
+    if restart_debug_session:
+        stop_stale_edge_debug_session(config)
+    elif is_port_open("127.0.0.1", cdp_port):
+        logging.info("偵測到 %s 已開啟，沿用既有 Edge debug session", cdp_port)
         return
 
     edge_path = config.get(
@@ -145,7 +294,7 @@ def start_edge_if_needed(config: dict) -> None:
 
     args = [
         edge_path,
-        "--remote-debugging-port=9222",
+        f"--remote-debugging-port={cdp_port}",
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
@@ -153,17 +302,17 @@ def start_edge_if_needed(config: dict) -> None:
         chatgpt_url,
     ]
 
-    logging.info("啟動 Edge debug：%s", args)
+    logging.info("starting fresh Edge debug session: %s", args)
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     for _ in range(30):
-        if is_port_open("127.0.0.1", 9222):
-            logging.info("Edge debug port 已啟動")
+        if is_port_open("127.0.0.1", cdp_port):
+            logging.info("Edge debug port %s 已就緒", cdp_port)
             time.sleep(3)
             return
         time.sleep(1)
 
-    raise RuntimeError("已嘗試啟動 Edge，但 9222 port 沒有開啟")
+    raise RuntimeError(f"已嘗試啟動 Edge，但 {cdp_port} port 沒有開啟")
 
 
 def save_screenshot(page, prefix: str = "debug") -> None:
@@ -787,7 +936,7 @@ def run(args: argparse.Namespace) -> int:
 
     with sync_playwright() as p:
         cdp_url = config.get("cdp_url", "http://127.0.0.1:9222")
-        logging.info("連線到 Edge CDP：%s", cdp_url)
+        logging.info("connecting over CDP: %s", cdp_url)
 
         browser = p.chromium.connect_over_cdp(cdp_url)
 

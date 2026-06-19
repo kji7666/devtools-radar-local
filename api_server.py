@@ -2881,7 +2881,7 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
 
         code, stdout, stderr, raw_output = await run_main_with_prompt(
             prompt_text,
-            timeout_seconds=120,
+            timeout_seconds=300,
         )
 
         if code != 0:
