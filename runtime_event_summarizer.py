@@ -87,7 +87,10 @@ def summarize_run_summary(summary: dict | None) -> dict:
 
     return {
         "run_id": summary.get("run_id"),
+        "workflow_mode": summary.get("workflow_mode"),
         "selected_agent": summary.get("selected_agent"),
+        "active_stage": summary.get("active_stage"),
+        "workflow_status": summary.get("workflow_status"),
         "loaded_skills": list(summary.get("loaded_skills") or []),
         "tool_calls_count": int(summary.get("tool_calls_count") or 0),
         "mcp_internal_tool_calls": int(summary.get("mcp_internal_tool_calls") or 0),

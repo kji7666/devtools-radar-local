@@ -514,6 +514,39 @@ textarea {
   max-height: 260px;
 }
 
+.workflow-stage-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflow-stage-pill {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #303644;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.2;
+  background: #171a21;
+  color: #d8dcff;
+}
+
+.workflow-stage-pill.completed {
+  border-color: #2f6b4f;
+  color: #9df2c0;
+}
+
+.workflow-stage-pill.skipped {
+  border-color: #4a4f5d;
+  color: #c6cbd2;
+}
+
+.workflow-stage-pill.failed {
+  border-color: #7c2b36;
+  color: #ffb3c1;
+}
+
 .event-actions {
   display: flex;
   flex-wrap: wrap;

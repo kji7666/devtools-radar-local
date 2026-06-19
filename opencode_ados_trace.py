@@ -20,6 +20,30 @@ ADOS_ROLE_NAMES = [
     "ados-verifier",
 ]
 
+ADOS_STAGE_ORDER = [
+    "planner",
+    "explorer",
+    "builder",
+    "verifier",
+    "reviewer",
+]
+
+ADOS_ROLE_TO_STAGE = {
+    "ados-planner": "planner",
+    "ados-explorer": "explorer",
+    "ados-builder": "builder",
+    "ados-verifier": "verifier",
+    "ados-reviewer": "reviewer",
+}
+
+ADOS_ROLE_TO_WORKFLOW_MODE = {
+    "ados-planner": "single_agent_planner",
+    "ados-explorer": "single_agent_explorer",
+    "ados-builder": "single_agent_builder",
+    "ados-verifier": "single_agent_verifier",
+    "ados-reviewer": "single_agent_reviewer",
+}
+
 
 def _safe_rel(path: Path) -> str:
     try:
@@ -195,6 +219,131 @@ def _append_event_compat(
         payload=payload,
         level=level,
         status=status,
+    )
+
+
+def build_ados_workflow_info(selected_agent: Optional[str]) -> Dict[str, Any]:
+    selected = str(selected_agent or "").strip()
+    workflow_mode = ADOS_ROLE_TO_WORKFLOW_MODE.get(selected, "single_agent_unknown")
+    active_stage = ADOS_ROLE_TO_STAGE.get(selected, "")
+    workflow_id = f"ados-workflow-{active_stage or 'unknown'}"
+
+    return {
+        "workflow_id": workflow_id,
+        "workflow_mode": workflow_mode,
+        "selected_agent": selected,
+        "active_stage": active_stage,
+        "stages": list(ADOS_STAGE_ORDER),
+    }
+
+
+def emit_ados_workflow_started_events(
+    append_event: Callable[..., Any],
+    workflow_info: Dict[str, Any],
+) -> None:
+    workflow_id = workflow_info.get("workflow_id", "")
+    workflow_mode = workflow_info.get("workflow_mode", "single_agent_unknown")
+    selected_agent = workflow_info.get("selected_agent", "")
+    active_stage = workflow_info.get("active_stage", "")
+    stages = list(workflow_info.get("stages") or ADOS_STAGE_ORDER)
+
+    _append_event_compat(
+        append_event,
+        event_type="opencode_ados_workflow_started",
+        title="ADOS workflow started",
+        preview=f"workflow={workflow_mode} agent={selected_agent or 'unknown'} stage={active_stage or 'unknown'}",
+        payload={
+            "workflow_id": workflow_id,
+            "workflow_mode": workflow_mode,
+            "selected_agent": selected_agent,
+            "active_stage": active_stage,
+            "stages": stages,
+        },
+    )
+
+    for stage in stages:
+        if stage == active_stage:
+            continue
+
+        _append_event_compat(
+            append_event,
+            event_type="opencode_ados_stage_skipped",
+            title="ADOS stage skipped",
+            preview=f"stage={stage} reason=single_agent_workflow",
+            payload={
+                "workflow_id": workflow_id,
+                "workflow_mode": workflow_mode,
+                "selected_agent": selected_agent,
+                "stage": stage,
+                "reason": "single_agent_workflow",
+            },
+        )
+
+    _append_event_compat(
+        append_event,
+        event_type="opencode_ados_stage_started",
+        title="ADOS stage started",
+        preview=f"stage={active_stage or 'unknown'} agent={selected_agent or 'unknown'}",
+        payload={
+            "workflow_id": workflow_id,
+            "workflow_mode": workflow_mode,
+            "selected_agent": selected_agent,
+            "stage": active_stage,
+        },
+    )
+
+
+def emit_ados_workflow_completed_events(
+    append_event: Callable[..., Any],
+    workflow_info: Dict[str, Any],
+    *,
+    status: str,
+    duration_ms: Optional[int] = None,
+) -> None:
+    workflow_id = workflow_info.get("workflow_id", "")
+    workflow_mode = workflow_info.get("workflow_mode", "single_agent_unknown")
+    selected_agent = workflow_info.get("selected_agent", "")
+    active_stage = workflow_info.get("active_stage", "")
+    stages = list(workflow_info.get("stages") or ADOS_STAGE_ORDER)
+    skipped_stages = [stage for stage in stages if stage != active_stage]
+    completed_stages = [active_stage] if active_stage and status == "completed" else []
+    failed_stages = [active_stage] if active_stage and status == "error" else []
+
+    _append_event_compat(
+        append_event,
+        event_type="opencode_ados_stage_finished",
+        title="ADOS stage finished",
+        preview=f"stage={active_stage or 'unknown'} status={status}",
+        payload={
+            "workflow_id": workflow_id,
+            "workflow_mode": workflow_mode,
+            "selected_agent": selected_agent,
+            "stage": active_stage,
+            "status": status,
+        },
+        status="error" if status == "error" else "success",
+    )
+
+    _append_event_compat(
+        append_event,
+        event_type="opencode_ados_workflow_completed",
+        title="ADOS workflow completed",
+        preview=(
+            f"workflow={workflow_mode} status={status} "
+            f"completed={active_stage or 'unknown'} skipped={len(skipped_stages)}"
+        ),
+        payload={
+            "workflow_id": workflow_id,
+            "workflow_mode": workflow_mode,
+            "selected_agent": selected_agent,
+            "active_stage": active_stage,
+            "completed_stages": completed_stages,
+            "skipped_stages": skipped_stages,
+            "failed_stages": failed_stages,
+            "status": status,
+            "duration_ms": duration_ms,
+        },
+        status="error" if status == "error" else "success",
     )
 
 def emit_ados_trace_events(

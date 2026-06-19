@@ -41,7 +41,10 @@ from runtime_event_log import (
 )
 from opencode_ados_trace import (
     build_ados_template_instruction,
+    build_ados_workflow_info,
     build_selected_skill_instructions,
+    emit_ados_workflow_completed_events,
+    emit_ados_workflow_started_events,
     emit_ados_template_injected_event,
     emit_ados_template_loaded_event,
     emit_ados_trace_events,
@@ -2839,7 +2842,10 @@ def build_run_summary_payload(
 
     return {
         "run_id": run_id,
+        "workflow_mode": runtime_state.get("workflow_mode", ""),
         "selected_agent": runtime_state.get("selected_agent", ""),
+        "active_stage": runtime_state.get("active_stage", ""),
+        "workflow_status": final_status,
         "loaded_skills": list(runtime_state.get("loaded_skills") or []),
         "tool_calls_count": int(runtime_state.get("tool_calls_count") or 0),
         "mcp_internal_tool_calls": int(runtime_state.get("mcp_internal_tool_calls") or 0),
@@ -2923,6 +2929,9 @@ async def run_chat_with_mcp_loop(
     ados_instruction_info = build_ados_template_instruction(messages_for_ados)
     ados_instruction = ados_instruction_info.get("instruction", "")
     runtime_state["selected_agent"] = ados_instruction_info.get("selected", "")
+    runtime_state["workflow_info"] = build_ados_workflow_info(runtime_state.get("selected_agent"))
+    runtime_state["workflow_mode"] = runtime_state["workflow_info"].get("workflow_mode", "")
+    runtime_state["active_stage"] = runtime_state["workflow_info"].get("active_stage", "")
 
     emit_ados_template_loaded_event(
         safe_append_event,
@@ -2932,6 +2941,11 @@ async def run_chat_with_mcp_loop(
     emit_ados_template_injected_event(
         safe_append_event,
         ados_instruction_info,
+    )
+
+    emit_ados_workflow_started_events(
+        safe_append_event,
+        runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
     )
 
     skill_instruction_info = build_selected_skill_instructions(
@@ -3850,6 +3864,9 @@ async def chat_completions(
         "commands": [],
         "loaded_skills": [],
         "selected_agent": "",
+        "workflow_mode": "",
+        "active_stage": "",
+        "workflow_info": {},
         "tool_calls_count": 0,
         "mcp_internal_tool_calls": 0,
         "mcp_external_tool_calls": 0,
@@ -4003,6 +4020,13 @@ async def chat_completions(
             title="OpenCode run summary",
             preview=build_run_summary_preview(run_summary_payload),
             payload=run_summary_payload,
+            duration_ms=duration_ms,
+        )
+
+        emit_ados_workflow_completed_events(
+            safe_append_event,
+            runtime_state.get("workflow_info") or build_ados_workflow_info(runtime_state.get("selected_agent")),
+            status=str(run_summary_payload.get("workflow_status") or run_summary_payload.get("final_status") or "unknown"),
             duration_ms=duration_ms,
         )
 

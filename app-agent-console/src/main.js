@@ -431,6 +431,36 @@ function isRunSummaryEvent(event) {
   return event?.type === "opencode_run_summary_generated";
 }
 
+function isAdosWorkflowStartedEvent(event) {
+  return event?.type === "opencode_ados_workflow_started";
+}
+
+function isAdosStageSkippedEvent(event) {
+  return event?.type === "opencode_ados_stage_skipped";
+}
+
+function isAdosStageStartedEvent(event) {
+  return event?.type === "opencode_ados_stage_started";
+}
+
+function isAdosStageFinishedEvent(event) {
+  return event?.type === "opencode_ados_stage_finished";
+}
+
+function isAdosWorkflowCompletedEvent(event) {
+  return event?.type === "opencode_ados_workflow_completed";
+}
+
+function isAdosWorkflowEvent(event) {
+  return (
+    isAdosWorkflowStartedEvent(event) ||
+    isAdosStageSkippedEvent(event) ||
+    isAdosStageStartedEvent(event) ||
+    isAdosStageFinishedEvent(event) ||
+    isAdosWorkflowCompletedEvent(event)
+  );
+}
+
 function isSummaryTraceEvent(event) {
   return isFileTraceEvent(event) || isValidationSummaryEvent(event) || isRunSummaryEvent(event);
 }
@@ -502,7 +532,56 @@ function getRunSummaryData(event) {
   };
 }
 
+function getAdosWorkflowData(event) {
+  const payload = getInnerPayload(event);
+  const stages = toArray(payload.stages);
+  const completedStages = toArray(payload.completed_stages);
+  const skippedStages = toArray(payload.skipped_stages);
+  const failedStages = toArray(payload.failed_stages);
+
+  return {
+    workflowId: typeof payload.workflow_id === "string" ? payload.workflow_id : "",
+    workflowMode: typeof payload.workflow_mode === "string" ? payload.workflow_mode : "",
+    selectedAgent: typeof payload.selected_agent === "string" ? payload.selected_agent : "",
+    activeStage: typeof payload.active_stage === "string" ? payload.active_stage : "",
+    stage: typeof payload.stage === "string" ? payload.stage : "",
+    reason: typeof payload.reason === "string" ? payload.reason : "",
+    status: typeof payload.status === "string" ? payload.status : "",
+    durationMs: Number.isFinite(Number(payload.duration_ms)) ? Number(payload.duration_ms) : null,
+    stages,
+    completedStages,
+    skippedStages,
+    failedStages,
+  };
+}
+
 function getEventSummaryText(event) {
+  if (isAdosWorkflowStartedEvent(event)) {
+    const details = getAdosWorkflowData(event);
+    return `workflow=${details.workflowMode || "single_agent_unknown"} agent=${details.selectedAgent || "unknown"} stage=${details.activeStage || "unknown"}`;
+  }
+
+  if (isAdosStageStartedEvent(event)) {
+    const details = getAdosWorkflowData(event);
+    return `stage=${details.stage || details.activeStage || "unknown"} agent=${details.selectedAgent || "unknown"}`;
+  }
+
+  if (isAdosStageFinishedEvent(event)) {
+    const details = getAdosWorkflowData(event);
+    return `stage=${details.stage || details.activeStage || "unknown"} status=${details.status || "unknown"}`;
+  }
+
+  if (isAdosStageSkippedEvent(event)) {
+    const details = getAdosWorkflowData(event);
+    return `stage=${details.stage || "unknown"} reason=${details.reason || "unknown"}`;
+  }
+
+  if (isAdosWorkflowCompletedEvent(event)) {
+    const details = getAdosWorkflowData(event);
+    const completedText = details.completedStages[0] || details.activeStage || "unknown";
+    return `workflow=${details.workflowMode || "single_agent_unknown"} status=${details.status || "unknown"} completed=${completedText} skipped=${details.skippedStages.length}`;
+  }
+
   if (isValidationSummaryEvent(event)) {
     const details = getValidationSummaryData(event);
     return `validation=${details.validationResult} commands=${details.commandsRun} tests=${details.testCommandsRun}`;
@@ -540,6 +619,22 @@ function renderFileListBlock(title, items) {
         ${rows.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
       </ul>
     </section>
+  `;
+}
+
+function renderWorkflowStagePills(items, type) {
+  const rows = toArray(items);
+
+  if (!rows.length) {
+    return "";
+  }
+
+  return `
+    <div class="workflow-stage-list">
+      ${rows
+        .map((item) => `<span class="workflow-stage-pill ${escapeHtml(type)}">${escapeHtml(item)}</span>`)
+        .join("")}
+    </div>
   `;
 }
 
@@ -620,7 +715,131 @@ function renderRunSummaryDetails(event) {
   `;
 }
 
+function renderAdosWorkflowDetails(event) {
+  if (!isAdosWorkflowEvent(event)) {
+    return "";
+  }
+
+  const details = getAdosWorkflowData(event);
+  const durationText = details.durationMs !== null ? formatDuration(details.durationMs) : "";
+
+  if (isAdosWorkflowStartedEvent(event)) {
+    return `
+      <section class="trace-panel">
+        <section class="trace-block">
+          <h4>ADOS Workflow</h4>
+          ${renderSummaryMetricRows([
+            { label: "workflow", value: details.workflowMode },
+            { label: "agent", value: details.selectedAgent },
+            { label: "active stage", value: details.activeStage },
+            { label: "workflow id", value: details.workflowId },
+          ])}
+        </section>
+        ${renderFileListBlock("Stages", details.stages)}
+      </section>
+    `;
+  }
+
+  if (isAdosStageSkippedEvent(event)) {
+    return `
+      <section class="trace-panel">
+        <section class="trace-block">
+          <h4>ADOS Stage</h4>
+          ${renderSummaryMetricRows([
+            { label: "stage", value: details.stage },
+            { label: "status", value: "skipped" },
+            { label: "reason", value: details.reason },
+            { label: "agent", value: details.selectedAgent },
+            { label: "workflow", value: details.workflowMode },
+          ])}
+        </section>
+      </section>
+    `;
+  }
+
+  if (isAdosStageStartedEvent(event)) {
+    return `
+      <section class="trace-panel">
+        <section class="trace-block">
+          <h4>ADOS Stage</h4>
+          ${renderSummaryMetricRows([
+            { label: "stage", value: details.stage || details.activeStage },
+            { label: "status", value: "started" },
+            { label: "agent", value: details.selectedAgent },
+            { label: "workflow", value: details.workflowMode },
+          ])}
+        </section>
+      </section>
+    `;
+  }
+
+  if (isAdosStageFinishedEvent(event)) {
+    return `
+      <section class="trace-panel">
+        <section class="trace-block">
+          <h4>ADOS Stage</h4>
+          ${renderSummaryMetricRows([
+            { label: "stage", value: details.stage || details.activeStage },
+            { label: "status", value: details.status },
+            { label: "agent", value: details.selectedAgent },
+            { label: "workflow", value: details.workflowMode },
+          ])}
+        </section>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="trace-panel">
+      <section class="trace-block">
+        <h4>ADOS Workflow Completed</h4>
+        ${renderSummaryMetricRows([
+          { label: "workflow", value: details.workflowMode },
+          { label: "status", value: details.status },
+          { label: "agent", value: details.selectedAgent },
+          { label: "active stage", value: details.activeStage },
+          { label: "duration", value: durationText },
+        ])}
+      </section>
+      ${
+        details.completedStages.length
+          ? `
+            <section class="trace-block">
+              <h4>Completed stages</h4>
+              ${renderWorkflowStagePills(details.completedStages, "completed")}
+            </section>
+          `
+          : ""
+      }
+      ${
+        details.skippedStages.length
+          ? `
+            <section class="trace-block">
+              <h4>Skipped stages</h4>
+              ${renderWorkflowStagePills(details.skippedStages, "skipped")}
+            </section>
+          `
+          : ""
+      }
+      ${
+        details.failedStages.length
+          ? `
+            <section class="trace-block">
+              <h4>Failed stages</h4>
+              ${renderWorkflowStagePills(details.failedStages, "failed")}
+            </section>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
 function renderEventDetails(event) {
+  if (isAdosWorkflowEvent(event)) {
+    return renderAdosWorkflowDetails(event);
+  }
+
   if (isFileTraceEvent(event)) {
     return renderFileTraceDetails(event);
   }
