@@ -13,6 +13,7 @@ if os.name == "nt":
         pass
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -38,12 +39,22 @@ from runtime_event_log import (
     list_runs,
     delete_run,
 )
+from opencode_ados_trace import (
+    build_ados_template_instruction,
+    build_selected_skill_instructions,
+    emit_ados_template_injected_event,
+    emit_ados_template_loaded_event,
+    emit_ados_trace_events,
+    emit_opencode_skill_trace_events,
+)
 from runtime_event_summarizer import (
     summarize_chat_request,
     summarize_chat_response,
     summarize_tool_calls_from_response,
     summarize_error,
     build_text_debug_fields,
+    summarize_changed_files_snapshot,
+    summarize_diff_generated_snapshot,
 )
 from runtime_lifecycle_summarizer import (
     summarize_opencode_request,
@@ -304,6 +315,39 @@ def format_tool_call_for_prompt(tool_call: dict[str, Any]) -> str:
         }
     )
 
+def build_api_prompt(
+    messages: list[ChatMessage],
+    tools: Optional[list[dict[str, Any]]],
+    tool_choice: Any,
+    ados_instruction: str = "",
+) -> str:
+    tools_prompt = build_tools_prompt(tools, tool_choice)
+    messages_prompt = build_messages_prompt(messages)
+
+    parts = [
+        """
+你是透過本機 API 包裝的 ChatGPT Web UI。
+請根據下列對話內容回答。
+請保留 Markdown 格式。
+""".strip()
+    ]
+
+    if ados_instruction:
+        parts.append(
+            """
+以下是本次 OpenCode/ADOS 執行角色設定。
+這段設定會約束本次 coding agent 的行為。
+""".strip()
+        )
+        parts.append(ados_instruction)
+
+    if tools_prompt:
+        parts.append(tools_prompt)
+
+    parts.append("以下是對話內容：")
+    parts.append(messages_prompt)
+
+    return "\n\n---\n\n".join(parts).strip()
 
 def build_messages_prompt(messages: list[ChatMessage]) -> str:
     rendered: list[str] = []
@@ -320,6 +364,7 @@ def build_messages_prompt(messages: list[ChatMessage]) -> str:
 
         elif role == "assistant":
             rendered.append(f"[assistant]\n{content}")
+
             if msg.tool_calls:
                 rendered.append("[assistant_tool_calls]")
                 for call in msg.tool_calls:
@@ -335,7 +380,7 @@ def build_messages_prompt(messages: list[ChatMessage]) -> str:
         else:
             rendered.append(f"[{role}]\n{content}")
 
-    return "\n\n".join(rendered).strip()
+    return "\n\n".join(x for x in rendered if x).strip()
 
 def build_tools_prompt(tools: Optional[list[dict[str, Any]]], tool_choice: Any) -> str:
     if not tools:
@@ -388,11 +433,11 @@ tool_choice:
 12. 最終回答請盡量保留 Markdown。
 """.strip()
 
-
 def build_api_prompt(
     messages: list[ChatMessage],
     tools: Optional[list[dict[str, Any]]],
     tool_choice: Any,
+    ados_instruction: str = "",
 ) -> str:
     tools_prompt = build_tools_prompt(tools, tool_choice)
     messages_prompt = build_messages_prompt(messages)
@@ -404,6 +449,15 @@ def build_api_prompt(
 請保留 Markdown 格式。
 """.strip()
     ]
+
+    if ados_instruction:
+        parts.append(
+            """
+以下是本次 OpenCode/ADOS 執行角色設定。
+這段設定會約束本次 coding agent 的行為。
+""".strip()
+        )
+        parts.append(ados_instruction)
 
     if tools_prompt:
         parts.append(tools_prompt)
@@ -2455,6 +2509,135 @@ def safe_append_event(**kwargs):
     except Exception:
         return None
 
+
+def _safe_rel_git_path(path_text: str) -> str:
+    return str(path_text or "").replace("\\", "/").strip()
+
+
+def capture_git_diff_snapshot() -> dict[str, Any]:
+    empty_snapshot = {
+        "changed_files": [],
+        "additions": 0,
+        "deletions": 0,
+        "diff_preview": "",
+        "files": {},
+    }
+
+    try:
+        numstat_result = subprocess.run(
+            ["git", "-c", "core.quotepath=off", "diff", "--numstat", "--no-ext-diff", "--"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return dict(empty_snapshot)
+
+    if numstat_result.returncode != 0:
+        return dict(empty_snapshot)
+
+    files: dict[str, dict[str, Any]] = {}
+    changed_files: list[str] = []
+    additions = 0
+    deletions = 0
+
+    for raw_line in (numstat_result.stdout or "").splitlines():
+        parts = raw_line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+
+        added_text, deleted_text, raw_path = parts
+        path = _safe_rel_git_path(raw_path)
+        if not path:
+            continue
+
+        file_additions = int(added_text) if added_text.isdigit() else 0
+        file_deletions = int(deleted_text) if deleted_text.isdigit() else 0
+
+        try:
+            patch_result = subprocess.run(
+                ["git", "-c", "core.quotepath=off", "diff", "--no-ext-diff", "--", raw_path],
+                cwd=str(BASE_DIR),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+            )
+            patch_text = patch_result.stdout if patch_result.returncode == 0 else ""
+        except Exception:
+            patch_text = ""
+
+        changed_files.append(path)
+        additions += file_additions
+        deletions += file_deletions
+        files[path] = {
+            "path": path,
+            "additions": file_additions,
+            "deletions": file_deletions,
+            "patch": patch_text,
+        }
+
+    return {
+        "changed_files": changed_files,
+        "additions": additions,
+        "deletions": deletions,
+        "diff_preview": "\n".join(
+            file_info.get("patch", "")
+            for file_info in files.values()
+            if file_info.get("patch")
+        ),
+        "files": files,
+    }
+
+
+def build_git_diff_delta(
+    baseline_snapshot: dict[str, Any] | None,
+    current_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    baseline_files = (baseline_snapshot or {}).get("files") or {}
+    current_files = (current_snapshot or {}).get("files") or {}
+
+    changed_files: list[str] = []
+    additions = 0
+    deletions = 0
+    patch_parts: list[str] = []
+
+    for path in current_snapshot.get("changed_files") or [] if isinstance(current_snapshot, dict) else []:
+        current_file = current_files.get(path) or {}
+        baseline_file = baseline_files.get(path) or {}
+
+        current_patch = str(current_file.get("patch") or "")
+        baseline_patch = str(baseline_file.get("patch") or "")
+        current_additions = int(current_file.get("additions") or 0)
+        current_deletions = int(current_file.get("deletions") or 0)
+        baseline_additions = int(baseline_file.get("additions") or 0)
+        baseline_deletions = int(baseline_file.get("deletions") or 0)
+
+        if (
+            current_patch == baseline_patch
+            and current_additions == baseline_additions
+            and current_deletions == baseline_deletions
+        ):
+            continue
+
+        changed_files.append(path)
+        additions += max(0, current_additions - baseline_additions)
+        deletions += max(0, current_deletions - baseline_deletions)
+
+        if current_patch:
+            patch_parts.append(current_patch)
+
+    return {
+        "changed_files": changed_files,
+        "additions": additions,
+        "deletions": deletions,
+        "diff_preview": "\n".join(x for x in patch_parts if x).strip(),
+    }
+
 def tool_call_name(tool_call: dict[str, Any]) -> str:
     fn = tool_call.get("function") or {}
     return str(fn.get("name") or "")
@@ -2511,6 +2694,36 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
     )
 
     messages = [ChatMessage(**m.model_dump()) for m in req.messages]
+    messages_for_ados = [m.model_dump() for m in messages]
+
+    ados_instruction_info = build_ados_template_instruction(messages_for_ados)
+    ados_instruction = ados_instruction_info.get("instruction", "")
+
+    emit_ados_template_loaded_event(
+        safe_append_event,
+        ados_instruction_info,
+    )
+
+    emit_ados_template_injected_event(
+        safe_append_event,
+        ados_instruction_info,
+    )
+
+    skill_instruction_info = build_selected_skill_instructions(
+        messages_for_ados,
+        max_skills=2,
+    )
+    skill_instruction = skill_instruction_info.get("instruction", "")
+
+    emit_opencode_skill_trace_events(
+        safe_append_event,
+        skill_instruction_info,
+    )
+
+    opencode_instruction_parts = [
+        x for x in [ados_instruction, skill_instruction] if x
+    ]
+    opencode_instruction = "\n\n---\n\n".join(opencode_instruction_parts)
 
     request_tools = req.tools or []
 
@@ -2529,6 +2742,7 @@ async def run_chat_with_mcp_loop(req: ChatCompletionRequest) -> dict[str, Any]:
             messages=messages,
             tools=all_tools,
             tool_choice=req.tool_choice,
+            ados_instruction=opencode_instruction,
         )
         last_prompt = prompt_text
 
@@ -3336,6 +3550,25 @@ async def chat_completions(
         payload=request_summary,
     )
 
+    try:
+        emit_ados_trace_events(
+            safe_append_event,
+            messages=body.get("messages", []) if isinstance(body, dict) else [],
+            source="api_server",
+        )
+    except Exception as exc:
+        safe_append_event(
+            source="opencode-ados",
+            event_type="opencode_ados_trace_error",
+            title="ADOS trace 錯誤",
+            preview=str(exc)[:240],
+            payload={
+                "source": "api_server",
+                "error": str(exc),
+            },
+        )
+
+
     safe_append_event(
         source="opencode-runtime",
         event_type="opencode_request_received",
@@ -3360,6 +3593,8 @@ async def chat_completions(
     )
 
     try:
+        git_diff_baseline = capture_git_diff_snapshot()
+
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_loop_started",
@@ -3384,7 +3619,35 @@ async def chat_completions(
             payload=summarize_loop_result(result),
         )
 
+        git_diff_current = capture_git_diff_snapshot()
+        git_diff_delta = build_git_diff_delta(git_diff_baseline, git_diff_current)
+
         duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_changed_files_detected",
+            title="Detected changed files",
+            preview=(
+                f"changed_files={len(git_diff_delta.get('changed_files') or [])} "
+                f"additions={git_diff_delta.get('additions', 0)} "
+                f"deletions={git_diff_delta.get('deletions', 0)}"
+            ),
+            payload=summarize_changed_files_snapshot(git_diff_delta),
+            duration_ms=duration_ms,
+        )
+
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_diff_generated",
+            title="Generated git diff preview",
+            preview=(
+                f"changed_files={len(git_diff_delta.get('changed_files') or [])} "
+                f"diff_preview_length={len(git_diff_delta.get('diff_preview') or '')}"
+            ),
+            payload=summarize_diff_generated_snapshot(git_diff_delta),
+            duration_ms=duration_ms,
+        )
 
         if isinstance(result, dict) and "error" in result:
             safe_append_event(
