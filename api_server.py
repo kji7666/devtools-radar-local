@@ -83,6 +83,9 @@ MCP_TOOL_SNAPSHOT_PATH = BASE_DIR / "mcp_tool_snapshots.json"
 API_TMP_DIR.mkdir(exist_ok=True)
 API_LOG_DIR.mkdir(exist_ok=True)
 
+MAX_UNTRACKED_FILE_PREVIEW_BYTES = 4096
+MAX_TOTAL_DIFF_PREVIEW_CHARS = 12000
+
 DEFAULT_MODEL = "chatgpt-web-local"
 SERVER_VERSION = "0.7.0"
 MAX_TOOL_LOOPS = 5
@@ -2514,6 +2517,77 @@ def _safe_rel_git_path(path_text: str) -> str:
     return str(path_text or "").replace("\\", "/").strip()
 
 
+def _bounded_text(text: str, limit: int) -> str:
+    return text[: max(0, limit)]
+
+
+def _read_untracked_file_preview(path: Path) -> str:
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+
+        size_bytes = path.stat().st_size
+        if size_bytes > MAX_UNTRACKED_FILE_PREVIEW_BYTES:
+            return ""
+
+        raw = path.read_bytes()
+        if b"\x00" in raw:
+            return ""
+
+        text = raw.decode("utf-8", errors="replace")
+        return _bounded_text(text, MAX_UNTRACKED_FILE_PREVIEW_BYTES)
+    except Exception:
+        return ""
+
+
+def _collect_untracked_files() -> dict[str, dict[str, Any]]:
+    try:
+        status_result = subprocess.run(
+            ["git", "-c", "core.quotepath=off", "status", "--porcelain", "--untracked-files=all"],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return {}
+
+    if status_result.returncode != 0:
+        return {}
+
+    untracked_files: dict[str, dict[str, Any]] = {}
+
+    for raw_line in (status_result.stdout or "").splitlines():
+        if not raw_line.startswith("?? "):
+            continue
+
+        raw_path = raw_line[3:].strip()
+        path = _safe_rel_git_path(raw_path)
+        if not path:
+            continue
+
+        absolute_path = BASE_DIR / Path(path.replace("/", os.sep))
+
+        try:
+            stat_info = absolute_path.stat()
+            size_bytes = int(stat_info.st_size)
+            mtime_ns = int(getattr(stat_info, "st_mtime_ns", int(stat_info.st_mtime * 1_000_000_000)))
+        except Exception:
+            size_bytes = 0
+            mtime_ns = 0
+
+        untracked_files[path] = {
+            "path": path,
+            "size_bytes": size_bytes,
+            "mtime_ns": mtime_ns,
+            "preview": _read_untracked_file_preview(absolute_path),
+        }
+
+    return untracked_files
+
+
 def capture_git_diff_snapshot() -> dict[str, Any]:
     empty_snapshot = {
         "changed_files": [],
@@ -2521,6 +2595,8 @@ def capture_git_diff_snapshot() -> dict[str, Any]:
         "deletions": 0,
         "diff_preview": "",
         "files": {},
+        "untracked_files": [],
+        "untracked": {},
     }
 
     try:
@@ -2581,6 +2657,8 @@ def capture_git_diff_snapshot() -> dict[str, Any]:
             "patch": patch_text,
         }
 
+    untracked_files = _collect_untracked_files()
+
     return {
         "changed_files": changed_files,
         "additions": additions,
@@ -2591,6 +2669,8 @@ def capture_git_diff_snapshot() -> dict[str, Any]:
             if file_info.get("patch")
         ),
         "files": files,
+        "untracked_files": list(untracked_files.keys()),
+        "untracked": untracked_files,
     }
 
 
@@ -2600,8 +2680,11 @@ def build_git_diff_delta(
 ) -> dict[str, Any]:
     baseline_files = (baseline_snapshot or {}).get("files") or {}
     current_files = (current_snapshot or {}).get("files") or {}
+    baseline_untracked = (baseline_snapshot or {}).get("untracked") or {}
+    current_untracked = (current_snapshot or {}).get("untracked") or {}
 
     changed_files: list[str] = []
+    untracked_files: list[str] = []
     additions = 0
     deletions = 0
     patch_parts: list[str] = []
@@ -2631,11 +2714,47 @@ def build_git_diff_delta(
         if current_patch:
             patch_parts.append(current_patch)
 
+    for path in current_snapshot.get("untracked_files") or [] if isinstance(current_snapshot, dict) else []:
+        current_file = current_untracked.get(path) or {}
+        baseline_file = baseline_untracked.get(path) or {}
+
+        current_size = int(current_file.get("size_bytes") or 0)
+        baseline_size = int(baseline_file.get("size_bytes") or 0)
+        current_mtime = int(current_file.get("mtime_ns") or 0)
+        baseline_mtime = int(baseline_file.get("mtime_ns") or 0)
+        current_preview = str(current_file.get("preview") or "")
+        baseline_preview = str(baseline_file.get("preview") or "")
+
+        if (
+            baseline_file
+            and current_size == baseline_size
+            and current_mtime == baseline_mtime
+            and current_preview == baseline_preview
+        ):
+            continue
+
+        untracked_files.append(path)
+        if path not in changed_files:
+            changed_files.append(path)
+
+        if current_preview:
+            patch_parts.append(
+                "\n".join(
+                    [
+                        f"--- untracked: {path} ---",
+                        current_preview,
+                    ]
+                ).strip()
+            )
+
+    diff_preview = "\n\n".join(x for x in patch_parts if x).strip()
+
     return {
         "changed_files": changed_files,
         "additions": additions,
         "deletions": deletions,
-        "diff_preview": "\n".join(x for x in patch_parts if x).strip(),
+        "diff_preview": _bounded_text(diff_preview, MAX_TOTAL_DIFF_PREVIEW_CHARS),
+        "untracked_files": untracked_files,
     }
 
 def tool_call_name(tool_call: dict[str, Any]) -> str:

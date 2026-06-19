@@ -39,12 +39,15 @@ def build_text_debug_fields(name: str, value, limit: int = TEXT_PREVIEW_LIMIT) -
 def summarize_changed_files_snapshot(snapshot: dict | None) -> dict:
     snapshot = snapshot or {}
     changed_files = list(snapshot.get("changed_files") or [])
+    untracked_files = list(snapshot.get("untracked_files") or [])
 
     return {
         "changed_files": changed_files,
         "changed_files_count": len(changed_files),
         "additions": int(snapshot.get("additions") or 0),
         "deletions": int(snapshot.get("deletions") or 0),
+        "untracked_files": untracked_files,
+        "untracked_files_count": len(untracked_files),
     }
 
 
@@ -52,6 +55,7 @@ def summarize_diff_generated_snapshot(snapshot: dict | None) -> dict:
     snapshot = snapshot or {}
     diff_preview = _to_text(snapshot.get("diff_preview", ""))
     changed_files = list(snapshot.get("changed_files") or [])
+    untracked_files = list(snapshot.get("untracked_files") or [])
 
     return {
         "diff_preview": diff_preview,
@@ -59,6 +63,8 @@ def summarize_diff_generated_snapshot(snapshot: dict | None) -> dict:
         "additions": int(snapshot.get("additions") or 0),
         "deletions": int(snapshot.get("deletions") or 0),
         "changed_files": changed_files,
+        "untracked_files": untracked_files,
+        "untracked_files_count": len(untracked_files),
     }
 
 
