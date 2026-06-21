@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from datetime import datetime
 import logging
 import subprocess
@@ -30,13 +30,13 @@ class TaskSpec:
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
-        raise FileNotFoundError(f"找不到設定檔：{CONFIG_FILE}")
+        raise FileNotFoundError(f"Config file not found: {CONFIG_FILE}")
 
     with CONFIG_FILE.open("r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
     if not isinstance(config, dict):
-        raise ValueError("config.yaml 格式錯誤")
+        raise ValueError("config.yaml must contain an object")
 
     return config
 
@@ -98,8 +98,8 @@ def safe_name(path: Path) -> str:
 def acquire_lock() -> None:
     if LOCK_FILE.exists():
         raise RuntimeError(
-            f"偵測到鎖定檔 {LOCK_FILE}，可能已有任務正在執行。"
-            "如果確定沒有執行中，請手動刪除 .runner.lock。"
+            f"Runner lock already exists: {LOCK_FILE}. Another run may still be active. "
+            "If the previous run has already finished, delete .runner.lock manually."
         )
 
     LOCK_FILE.write_text(
@@ -113,7 +113,7 @@ def release_lock() -> None:
         if LOCK_FILE.exists():
             LOCK_FILE.unlink()
     except Exception:
-        logging.exception("刪除 lock file 失敗")
+        logging.exception("Failed to delete lock file")
 
 
 def is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -144,7 +144,7 @@ def find_pids_listening_on_port(port: int) -> set[int]:
             timeout=10,
         )
     except Exception:
-        logging.exception("查詢 CDP port PID 失敗")
+        logging.exception("Failed to inspect CDP port listeners")
         return set()
 
     pids: set[int] = set()
@@ -187,11 +187,11 @@ def find_edge_pids_for_profile(profile_dir: str) -> set[int]:
             timeout=15,
         )
     except Exception:
-        logging.exception("查詢 Edge profile PID 失敗")
+        logging.exception("Failed to inspect Edge profile PIDs")
         return set()
 
     if result.returncode != 0:
-        logging.warning("查詢 Edge profile PID 失敗: %s", (result.stderr or result.stdout or "").strip())
+        logging.warning("Failed to inspect Edge profile PIDs: %s", (result.stderr or result.stdout or "").strip())
         return set()
 
     pids: set[int] = set()
@@ -220,15 +220,15 @@ def stop_process_tree(pid: int) -> bool:
             timeout=15,
         )
     except Exception:
-        logging.exception("停止 PID %s 失敗", pid)
+        logging.exception("Failed to stop PID %s", pid)
         return False
 
     if result.returncode == 0:
-        logging.info("已停止 stale Edge debug PID=%s", pid)
+        logging.info("Stopped stale Edge debug PID=%s", pid)
         return True
 
     logging.warning(
-        "停止 PID %s 失敗: %s",
+        "Failed to stop PID %s: %s",
         pid,
         (result.stderr or result.stdout or f"code={result.returncode}").strip(),
     )
@@ -247,7 +247,7 @@ def stop_stale_edge_debug_session(config: dict) -> None:
     candidate_pids = port_pids | profile_pids
 
     if not candidate_pids:
-        logging.info("沒有找到需要停止的 stale Edge debug session")
+        logging.info("No stale Edge debug session found")
         return
 
     logging.info(
@@ -261,16 +261,16 @@ def stop_stale_edge_debug_session(config: dict) -> None:
 
     for _ in range(20):
         if not is_port_open("127.0.0.1", cdp_port):
-            logging.info("CDP port %s 已關閉", cdp_port)
+            logging.info("CDP port %s is now closed", cdp_port)
             return
         time.sleep(0.5)
 
-    logging.warning("CDP port %s 仍然開啟，可能仍有外部 Edge session 存活", cdp_port)
+    logging.warning("CDP port %s is still open after stale session cleanup", cdp_port)
 
 
 def start_edge_if_needed(config: dict) -> None:
     if not bool(config.get("auto_start_edge", True)):
-        logging.info("auto_start_edge=false，不自動啟動 Edge")
+        logging.info("auto_start_edge=false, skipping automatic Edge launch")
         return
 
     cdp_port = get_cdp_port(config)
@@ -279,7 +279,7 @@ def start_edge_if_needed(config: dict) -> None:
     if restart_debug_session:
         stop_stale_edge_debug_session(config)
     elif is_port_open("127.0.0.1", cdp_port):
-        logging.info("偵測到 %s 已開啟，沿用既有 Edge debug session", cdp_port)
+        logging.info("CDP port %s already has an active Edge debug session", cdp_port)
         return
 
     edge_path = config.get(
@@ -290,7 +290,7 @@ def start_edge_if_needed(config: dict) -> None:
     chatgpt_url = config.get("chatgpt_url", "https://chatgpt.com/")
 
     if not Path(edge_path).exists():
-        raise FileNotFoundError(f"找不到 Edge：{edge_path}")
+        raise FileNotFoundError(f"Edge executable not found: {edge_path}")
 
     args = [
         edge_path,
@@ -307,12 +307,12 @@ def start_edge_if_needed(config: dict) -> None:
 
     for _ in range(30):
         if is_port_open("127.0.0.1", cdp_port):
-            logging.info("Edge debug port %s 已就緒", cdp_port)
+            logging.info("Edge debug port %s is ready", cdp_port)
             time.sleep(3)
             return
         time.sleep(1)
 
-    raise RuntimeError(f"已嘗試啟動 Edge，但 {cdp_port} port 沒有開啟")
+    raise RuntimeError(f"Failed to start Edge: CDP port {cdp_port} did not open")
 
 
 def save_screenshot(page, prefix: str = "debug") -> None:
@@ -320,9 +320,9 @@ def save_screenshot(page, prefix: str = "debug") -> None:
 
     try:
         page.screenshot(path=str(screenshot_path), full_page=True)
-        logging.info("已儲存截圖：%s", screenshot_path)
+        logging.info("Saved screenshot: %s", screenshot_path)
     except Exception:
-        logging.exception("截圖失敗")
+        logging.exception("Failed to save screenshot")
 
 
 def write_latest_output(config: dict, content: str) -> None:
@@ -356,7 +356,7 @@ def move_with_timestamp(src: Path, dst_dir: Path, suffix: str = "") -> Path:
 def read_file_content(path: Path) -> str:
     content = path.read_text(encoding="utf-8").strip()
     if not content:
-        raise ValueError(f"{path.name} 是空的")
+        raise ValueError(f"{path.name} ?批捆?箇征")
     return content
 
 
@@ -436,7 +436,7 @@ def get_chatgpt_page(browser, config: dict):
         for page in context.pages:
             try:
                 if "chatgpt.com" in page.url:
-                    logging.info("找到既有 ChatGPT 頁面：%s", page.url)
+                    logging.info("Found existing ChatGPT page: %s", page.url)
                     return page
             except Exception:
                 pass
@@ -446,9 +446,9 @@ def get_chatgpt_page(browser, config: dict):
 
     try:
         page.goto(chatgpt_url, wait_until="commit", timeout=30000)
-        logging.info("已開啟新的 ChatGPT 頁面")
+        logging.info("Opened a new ChatGPT page")
     except Exception as error:
-        logging.warning("開啟 ChatGPT 發生錯誤，但保留頁面：%s", error)
+        logging.warning("Failed to open ChatGPT directly, using current page: %s", error)
 
     return page
 
@@ -479,7 +479,7 @@ def wait_for_page_ready(page, config: dict):
     auto_refresh = bool(config.get("auto_refresh_if_not_ready", True))
     max_refresh_attempts = int(config.get("max_refresh_attempts", 2))
 
-    logging.info("等待 ChatGPT 聊天框出現，最多 %s 秒", timeout_seconds)
+    logging.info("Waiting for ChatGPT page to become ready, timeout=%s seconds", timeout_seconds)
 
     start = time.time()
     refresh_count = 0
@@ -488,42 +488,42 @@ def wait_for_page_ready(page, config: dict):
         composer = find_composer_once(page, config, timeout_ms=3000)
 
         if composer:
-            logging.info("ChatGPT 聊天框已就緒")
+            logging.info("ChatGPT page is ready")
             return composer
 
         elapsed = time.time() - start
-        logging.info("聊天框尚未出現，elapsed=%.1f", elapsed)
+        logging.info("Page still not ready, elapsed=%.1f", elapsed)
 
         if auto_refresh and refresh_count < max_refresh_attempts:
             if elapsed > 15 * (refresh_count + 1):
                 refresh_count += 1
-                logging.info("嘗試重新整理頁面，第 %s 次", refresh_count)
+                logging.info("Refreshing page, attempt %s", refresh_count)
                 try:
                     page.reload(wait_until="commit", timeout=30000)
                 except Exception as error:
-                    logging.warning("reload 失敗：%s", error)
+                    logging.warning("Reload failed: %s", error)
 
         time.sleep(3)
 
     save_screenshot(page, prefix="page_not_ready")
-    raise RuntimeError("等待 ChatGPT 聊天框逾時，請確認 Edge 頁面是否正常登入並可使用")
+    raise RuntimeError("Timed out waiting for ChatGPT page to become ready")
 
 
 def click_new_chat_if_needed(page, config: dict) -> None:
     if not bool(config.get("new_chat_per_task", False)):
-        logging.info("new_chat_per_task=false，沿用目前對話")
+        logging.info("new_chat_per_task=false, reusing the current conversation")
         return
 
-    logging.info("準備建立新對話")
+    logging.info("Preparing a new chat")
     chatgpt_url = config.get("chatgpt_url", "https://chatgpt.com/")
 
     try:
         page.goto(chatgpt_url, wait_until="commit", timeout=30000)
         time.sleep(3)
-        logging.info("已透過 goto 建立新對話")
+        logging.info("Opened a new chat by navigating to ChatGPT")
         return
     except Exception as error:
-        logging.warning("goto 新對話失敗，改用按鈕：%s", error)
+        logging.warning("Direct navigation to a new chat failed: %s", error)
 
     selectors = config.get("selectors", {}).get("new_chat_candidates", [])
 
@@ -533,16 +533,16 @@ def click_new_chat_if_needed(page, config: dict) -> None:
             button.wait_for(state="visible", timeout=5000)
             button.click()
             time.sleep(3)
-            logging.info("已點擊新對話：%s", selector)
+            logging.info("Clicked new chat selector: %s", selector)
             return
         except Exception as error:
-            logging.info("新對話 selector 不可用：%s，錯誤：%s", selector, error)
+            logging.info("New chat selector failed %s: %s", selector, error)
 
-    logging.warning("無法明確建立新對話，將沿用目前頁面")
+    logging.warning("No working new chat entry point found; continuing with the current chat")
 
 
 def clear_and_fill_composer(page, composer, content: str) -> None:
-    logging.info("開始輸入內容")
+    logging.info("皞?憛怠 prompt")
 
     composer.click()
     time.sleep(0.5)
@@ -554,9 +554,9 @@ def clear_and_fill_composer(page, composer, content: str) -> None:
 
     try:
         page.keyboard.insert_text(content)
-        logging.info("已使用 keyboard.insert_text() 輸入內容")
+        logging.info("Filled prompt using keyboard.insert_text()")
     except Exception as error:
-        logging.warning("keyboard.insert_text() 失敗，改用剪貼簿：%s", error)
+        logging.warning("keyboard.insert_text() failed, falling back to clipboard paste: %s", error)
 
         page.evaluate(
             """async text => {
@@ -565,7 +565,7 @@ def clear_and_fill_composer(page, composer, content: str) -> None:
             content,
         )
         page.keyboard.press("Control+V")
-        logging.info("已使用剪貼簿貼上內容")
+        logging.info("Filled prompt using clipboard paste fallback")
 
     time.sleep(1)
 
@@ -580,11 +580,11 @@ def click_send_button_if_available(page, config: dict) -> bool:
 
             if button.is_enabled():
                 button.click()
-                logging.info("已點擊送出按鈕：%s", selector)
+                logging.info("Clicked send button selector: %s", selector)
                 return True
 
         except Exception as error:
-            logging.info("送出按鈕不可用：%s，錯誤：%s", selector, error)
+            logging.info("Send button selector failed %s: %s", selector, error)
 
     return False
 
@@ -597,10 +597,10 @@ def submit_prompt(page, config: dict, composer, content: str, task_name: str) ->
     clicked = click_send_button_if_available(page, config)
 
     if not clicked:
-        logging.info("找不到送出按鈕，改用 Enter")
+        logging.info("No send button worked; pressing Enter instead")
         page.keyboard.press("Enter")
 
-    logging.info("已送出 prompt")
+    logging.info("Submitted prompt")
     time.sleep(3)
     save_screenshot(page, prefix=f"after_submit_{safe_name_text(task_name)}")
 
@@ -781,7 +781,7 @@ def get_last_assistant_message(page, config: dict) -> str:
         return last_message.inner_text(timeout=5000).strip()
 
     except Exception as error:
-        logging.warning("讀取 assistant markdown 失敗：%s", error)
+        logging.warning("Failed to extract assistant markdown: %s", error)
         return ""
     
 def wait_for_answer(page, config: dict) -> str:
@@ -793,7 +793,7 @@ def wait_for_answer(page, config: dict) -> str:
     last_text = ""
     stable_rounds = 0
 
-    logging.info("開始等待回覆，最多等待 %s 秒", timeout_seconds)
+    logging.info("Waiting for the answer to stabilize, timeout=%s seconds", timeout_seconds)
 
     while time.time() - start_time < timeout_seconds:
         current_text = get_last_assistant_message(page, config)
@@ -807,7 +807,7 @@ def wait_for_answer(page, config: dict) -> str:
                 last_text = current_text
 
             logging.info(
-                "目前回覆長度：%s，穩定次數：%s/%s，generating=%s",
+                "answer_length=%s stable_rounds=%s/%s generating=%s",
                 len(current_text),
                 stable_rounds,
                 required_stable_rounds,
@@ -815,17 +815,17 @@ def wait_for_answer(page, config: dict) -> str:
             )
 
             if stable_rounds >= required_stable_rounds and not generating:
-                logging.info("回覆穩定且不再生成，判定完成")
+                logging.info("Answer is stable and generation appears complete")
                 return current_text
 
         time.sleep(interval)
 
-    logging.warning("等待達上限，回傳目前取得內容")
+    logging.warning("Timed out waiting for a stable answer; returning the latest content")
     return last_text
 
 
 def process_one_task(page, config: dict, task: TaskSpec) -> dict:
-    logging.info("開始處理任務：%s", task.name)
+    logging.info("Processing task: %s", task.name)
 
     click_new_chat_if_needed(page, config)
 
@@ -837,7 +837,7 @@ def process_one_task(page, config: dict, task: TaskSpec) -> dict:
 
     if not answer:
         save_screenshot(page, prefix=f"no_answer_{safe_name_text(task.name)}")
-        raise RuntimeError(f"{task.name} 未取得回覆")
+        raise RuntimeError(f"{task.name} did not produce any answer")
 
     output_path = write_task_output(task.name, answer)
     write_latest_output(config, answer)
@@ -846,7 +846,7 @@ def process_one_task(page, config: dict, task: TaskSpec) -> dict:
     if task.archive_on_success and task.source_path and task.source_path.exists():
         archive_path = move_with_timestamp(task.source_path, ARCHIVE_DIR)
 
-    logging.info("任務完成：%s -> %s", task.name, output_path.name)
+    logging.info("Task completed: %s -> %s", task.name, output_path.name)
 
     return {
         "task": task.name,
@@ -865,11 +865,11 @@ def process_task_with_retry(page, config: dict, task: TaskSpec) -> dict:
 
     for attempt in range(retries + 1):
         try:
-            logging.info("任務 %s 嘗試第 %s 次", task.name, attempt + 1)
+            logging.info("Task %s attempt %s", task.name, attempt + 1)
             return process_one_task(page, config, task)
         except Exception as error:
             last_error = error
-            logging.exception("任務失敗：%s，第 %s 次", task.name, attempt + 1)
+            logging.exception("Task failed: %s attempt %s", task.name, attempt + 1)
             save_screenshot(page, prefix=f"failed_{safe_name_text(task.name)}_attempt_{attempt + 1}")
 
             if attempt < retries:
@@ -924,7 +924,7 @@ def run(args: argparse.Namespace) -> int:
     tasks = build_tasks_from_args(config, args)
 
     if not tasks:
-        message = "沒有找到任何任務。請輸入 prompt、指定檔案，或把 .txt 放到 tasks/。"
+        message = "No runnable tasks found. Provide prompt text, prompt_file, or place .txt tasks in tasks/."
         logging.warning(message)
         write_error_output(message)
         print(message)
@@ -952,10 +952,10 @@ def run(args: argparse.Namespace) -> int:
             success_count = sum(1 for item in results if item["status"] == "success")
             failed_count = sum(1 for item in results if item["status"] == "failed")
 
-            print(f"完成：成功 {success_count}，失敗 {failed_count}")
+            print(f"Completed: success {success_count}, failed {failed_count}")
             print(f"summary: {summary_path}")
 
-            logging.info("完成：成功 %s，失敗 %s", success_count, failed_count)
+            logging.info("Completed: success %s, failed %s", success_count, failed_count)
 
             return 1 if failed_count else 0
 
@@ -983,7 +983,7 @@ def main() -> int:
         return run(args)
 
     except Exception as error:
-        logging.exception("任務失敗")
+        logging.exception("Run failed")
         message = f"ERROR: {type(error).__name__}: {error}"
         write_error_output(message)
         print(message)

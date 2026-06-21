@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import asyncio
@@ -141,10 +141,10 @@ PASS_LIKE_VALIDATION_PATTERNS = [
     "npm build passed",
     "tests are passing",
     "test suite passed",
-    "驗證通過",
-    "測試通過",
-    "檢查通過",
-    "建置通過",
+    "tests ok",
+    "validation ok",
+    "checks ok",
+    "build ok",
 ]
 NEGATIVE_VALIDATION_PATTERNS = [
     "not run",
@@ -155,24 +155,24 @@ NEGATIVE_VALIDATION_PATTERNS = [
     "no validation was run",
     "unverified",
     "not verified",
-    "未驗證",
-    "未執行測試",
-    "沒有執行測試",
-    "未執行驗證",
+    "not executed",
+    "validation missing",
+    "tests missing",
+    "not checked",
 ]
 
 PLAN_BUILD_VERIFY_TRIGGER_PHRASES = [
     "ados-workflow plan-build-verify",
     "ados plan-build-verify",
-    "使用 ados plan-build-verify",
-    "使用 ados-workflow plan-build-verify",
+    "use ados plan-build-verify",
+    "use ados-workflow plan-build-verify",
 ]
 
 PLAN_BUILD_VERIFY_REVIEW_TRIGGER_PHRASES = [
     "ados-workflow plan-build-verify-review",
     "ados plan-build-verify-review",
-    "雿輻 ados plan-build-verify-review",
-    "雿輻 ados-workflow plan-build-verify-review",
+    "use ados plan-build-verify-review",
+    "use ados-workflow plan-build-verify-review",
 ]
 MUTATING_TOOL_HINTS = [
     "write_file",
@@ -452,17 +452,17 @@ def build_api_prompt(
 
     parts = [
         """
-你是透過本機 API 包裝的 ChatGPT Web UI。
-請根據下列對話內容回答。
-請保留 Markdown 格式。
+You are ChatGPT Web UI wrapped behind a local API.
+Answer based on the conversation below.
+Preserve Markdown formatting.
 """.strip()
     ]
 
     if ados_instruction:
         parts.append(
             """
-以下是本次 OpenCode/ADOS 執行角色設定。
-這段設定會約束本次 coding agent 的行為。
+The following OpenCode / ADOS role instructions are active for this run.
+Treat them as higher-priority project behavior for this coding task.
 """.strip()
         )
         parts.append(ados_instruction)
@@ -470,10 +470,11 @@ def build_api_prompt(
     if tools_prompt:
         parts.append(tools_prompt)
 
-    parts.append("以下是對話內容：")
+    parts.append("Conversation:")
     parts.append(messages_prompt)
 
     return "\n\n---\n\n".join(parts).strip()
+
 
 def build_messages_prompt(messages: list[ChatMessage]) -> str:
     rendered: list[str] = []
@@ -484,44 +485,40 @@ def build_messages_prompt(messages: list[ChatMessage]) -> str:
 
         if role == "system":
             rendered.append(f"[system]\n{content}")
-
         elif role == "user":
             rendered.append(f"[user]\n{content}")
-
         elif role == "assistant":
             rendered.append(f"[assistant]\n{content}")
-
             if msg.tool_calls:
                 rendered.append("[assistant_tool_calls]")
                 for call in msg.tool_calls:
                     rendered.append(format_tool_call_for_prompt(call))
-
         elif role == "tool":
             rendered.append(
                 f"[tool_result]\n"
                 f"tool_call_id: {msg.tool_call_id or ''}\n"
                 f"{content}"
             )
-
         else:
             rendered.append(f"[{role}]\n{content}")
 
     return "\n\n".join(x for x in rendered if x).strip()
+
 
 def build_tools_prompt(tools: Optional[list[dict[str, Any]]], tool_choice: Any) -> str:
     if not tools:
         return ""
 
     return f"""
-你現在正在扮演一個可被 OpenAI-compatible API 呼叫的 assistant。
+You may use the following tools and must follow the OpenAI-compatible assistant output format.
 
-你可以使用下列 tools。當你需要呼叫工具時，不要解釋，不要輸出 Markdown，不要輸出多餘文字，只能輸出以下格式：
+If you need to call a single tool, do not output normal Markdown first. Output:
 
 <tool_call>
 {{"name":"tool_name","arguments":{{...}}}}
 </tool_call>
 
-如果你需要一次呼叫多個工具，請輸出：
+If you need to call multiple tools at once, output:
 
 <tool_calls>
 [
@@ -530,13 +527,13 @@ def build_tools_prompt(tools: Optional[list[dict[str, Any]]], tool_choice: Any) 
 ]
 </tool_calls>
 
-如果你不需要工具，請輸出一般最終回答。若你想明確標示最終回答，可以使用：
+If you are ready to give the final answer, output:
 
 <final>
-你的回答
+your final answer
 </final>
 
-可用 tools：
+Available tools:
 
 {json_dumps(tools)}
 
@@ -544,56 +541,18 @@ tool_choice:
 
 {json_dumps(tool_choice)}
 
-重要規則：
-1. tool name 必須完全使用上面 tools 裡的 function.name。
-2. arguments 必須是合法 JSON object。
-3. 不要編造不存在的 tool name。
-4. 如果需要讀檔、改檔、列目錄、跑指令，必須優先呼叫工具，不要假裝已讀取或已修改。
-5. 如果使用者要求閱讀 AGENTS.md、docs/*.md、檢查 git diff、修改檔案，必須呼叫 OpenCode 提供的 read/edit/bash 等工具。
-6. 如果使用工具，只能輸出 <tool_call> 或 <tool_calls>，不要加任何自然語言。
-7. 不要把 tool call 包在 Markdown code block。
-8. arguments 必須是合法 JSON；Windows path 請優先使用正斜線，例如 C:/project/devtools-radar-local/AGENTS.md。
-9. 如果使用者已提供 tool_result，請根據 tool_result 繼續回答或決定下一個工具。
-10. 如果工具因安全策略被拒絕，請向使用者說明原因，不要假裝已執行。
-11. 如果工具回傳 pending_id，代表該工具需要人工確認，請清楚告訴使用者 pending_id。
-12. 最終回答請盡量保留 Markdown。
+Rules:
+1. `tool name` must exactly match a `function.name` from `tools`.
+2. `arguments` must be a valid JSON object.
+3. Do not invent tool names.
+4. When calling tools, output only `<tool_call>` or `<tool_calls>`, not extra prose first.
+5. Prefer the available OpenCode tools when the task needs files, diffs, commands, or repo context.
+6. Do not wrap tool calls in Markdown code fences.
+7. Use JSON strings for Windows paths, for example `C:/project/devtools-radar-local/AGENTS.md`.
+8. After receiving `tool_result`, either continue with the next tool call or provide the final answer.
+9. If a tool returns a `pending_id`, pass that exact `pending_id` in the required follow-up call.
+10. Put the final user-facing answer inside `<final>` and preserve Markdown.
 """.strip()
-
-def build_api_prompt(
-    messages: list[ChatMessage],
-    tools: Optional[list[dict[str, Any]]],
-    tool_choice: Any,
-    ados_instruction: str = "",
-) -> str:
-    tools_prompt = build_tools_prompt(tools, tool_choice)
-    messages_prompt = build_messages_prompt(messages)
-
-    parts = [
-        """
-你是透過本機 API 包裝的 ChatGPT Web UI。
-請根據下列對話內容回答。
-請保留 Markdown 格式。
-""".strip()
-    ]
-
-    if ados_instruction:
-        parts.append(
-            """
-以下是本次 OpenCode/ADOS 執行角色設定。
-這段設定會約束本次 coding agent 的行為。
-""".strip()
-        )
-        parts.append(ados_instruction)
-
-    if tools_prompt:
-        parts.append(tools_prompt)
-
-    parts.append("以下是對話內容：")
-    parts.append(messages_prompt)
-
-    return "\n\n---\n\n".join(parts).strip()
-
-
 def extract_tag(text: str, tag: str) -> Optional[str]:
     pattern = rf"<{tag}>\s*(.*?)\s*</{tag}>"
     match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
@@ -5471,7 +5430,7 @@ async def run_chat_with_mcp_loop(
     safe_append_event(
         source="mcp-runtime",
         event_type="mcp_native_loop_entered",
-        title="進入 native tool loop",
+        title="?脣 native tool loop",
         preview="run_chat_with_mcp_loop entered",
         payload={
             "request_type": type(req).__name__,
@@ -5548,7 +5507,7 @@ async def run_chat_with_mcp_loop(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_loop_iteration_started",
-            title="MCP loop iteration 開始",
+            title="MCP loop iteration ??",
             preview=f"loop_index={_loop_index} tools={len(all_tools)} messages={len(messages)}",
             payload={
                 "loop_index": _loop_index,
@@ -5568,7 +5527,7 @@ async def run_chat_with_mcp_loop(
             safe_append_event(
                 source="mcp-runtime",
                 event_type="mcp_runner_error",
-                title="ChatGPT Web runner 失敗",
+                title="ChatGPT Web runner error",
                 preview=f"code={code}",
                 level="error",
                 payload={
@@ -5593,7 +5552,7 @@ async def run_chat_with_mcp_loop(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_model_output_parsed",
-            title="模型輸出解析完成",
+            title="Model output parsed",
             preview=f"tool_calls={len(tool_calls or [])} content_length={len(content or '')}",
             payload={
                 "loop_index": _loop_index,
@@ -5628,7 +5587,7 @@ async def run_chat_with_mcp_loop(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_tool_calls_classified",
-            title="工具呼叫分類完成",
+            title="Tool calls classified",
             preview=f"mcp={len(executable_calls)} external={len(external_calls)}",
             payload={
                 "loop_index": _loop_index,
@@ -5701,7 +5660,7 @@ async def run_chat_with_mcp_loop(
             safe_append_event(
                 source="opencode-runtime",
                 event_type="opencode_native_tool_calls_returned",
-                title="回傳 OpenCode native tool calls",
+                title="Returned OpenCode native tool calls",
                 preview=f"external_tool_calls={len(external_calls)}",
                 payload={
                     "external_tool_calls_count": len(external_calls),
@@ -5799,7 +5758,7 @@ async def run_chat_with_mcp_loop(
             safe_append_event(
                 source="mcp-runtime",
                 event_type="mcp_tool_started",
-                title="MCP 工具開始執行",
+                title="MCP tool started",
                 preview=f"tool={name}",
                 payload={
                     "tool_name": name,
@@ -5838,7 +5797,7 @@ async def run_chat_with_mcp_loop(
                 safe_append_event(
                     source="mcp-runtime",
                     event_type="mcp_tool_finished",
-                    title="MCP 工具執行完成",
+                    title="MCP tool finished",
                     preview=f"tool={name} duration_ms={tool_duration_ms}",
                     payload={
                         "tool_name": name,
@@ -5889,7 +5848,7 @@ async def run_chat_with_mcp_loop(
                 safe_append_event(
                     source="mcp-runtime",
                     event_type="mcp_tool_error",
-                    title="MCP 工具執行失敗",
+                    title="MCP tool error",
                     preview=f"tool={name} error={error}",
                     level="error",
                     payload={
@@ -5947,7 +5906,7 @@ async def run_chat_with_mcp_loop(
             safe_append_event(
                 source="opencode-runtime",
                 event_type="opencode_mixed_tool_calls_returned",
-                title="回傳混合模式 OpenCode native tool calls",
+                title="Returned mixed OpenCode native tool calls",
                 preview=f"external_tool_calls={len(external_calls)}",
                 payload={
                     "external_tool_calls_count": len(external_calls),
@@ -5964,15 +5923,15 @@ async def run_chat_with_mcp_loop(
             )
 
     final_content = (
-        "工具呼叫已達最大輪數，停止自動 MCP loop。\n\n"
-        f"最後一次模型輸出：\n\n{raw_output}"
+        "Tool calls reached the maximum loop count, stopping automatic MCP loop.\n\n"
+        f"Last model output:\n\n{raw_output}"
     )
 
     loop_duration_ms = int((time.perf_counter() - loop_started_at) * 1000)
     safe_append_event(
         source="mcp-runtime",
         event_type="mcp_loop_max_iterations_reached",
-        title="MCP loop 達最大輪數",
+        title="MCP loop max iterations reached",
         preview=f"max_tool_loops={MAX_TOOL_LOOPS}",
         level="warning",
         payload={
@@ -6596,7 +6555,7 @@ async def chat_completions(
     safe_append_event(
         source="devtools-radar-api",
         event_type="model_request_received",
-        title="收到模型請求",
+        title="Model request received",
         preview=(
             f"model={body.get('model')} "
             f"messages={len(body.get('messages') or [])} "
@@ -6616,7 +6575,7 @@ async def chat_completions(
         safe_append_event(
             source="opencode-ados",
             event_type="opencode_ados_trace_error",
-            title="ADOS trace 錯誤",
+            title="ADOS trace error",
             preview=str(exc)[:240],
             payload={
                 "source": "api_server",
@@ -6628,7 +6587,7 @@ async def chat_completions(
     safe_append_event(
         source="opencode-runtime",
         event_type="opencode_request_received",
-        title="OpenCode/API 請求進入",
+        title="OpenCode/API request entered",
         preview=(
             f"model={body.get('model')} "
             f"messages={len(body.get('messages') or [])} "
@@ -6640,7 +6599,7 @@ async def chat_completions(
     safe_append_event(
         source="opencode-runtime",
         event_type="opencode_context_files_detected",
-        title="偵測 context files",
+        title="Detected context files",
         preview=f"context_files={len(context_files)}",
         payload={
             "context_files_count": len(context_files),
@@ -6654,7 +6613,7 @@ async def chat_completions(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_loop_started",
-            title="MCP loop 開始",
+            title="MCP loop started",
             preview=f"model={body.get('model')}",
             payload={
                 "model": body.get("model"),
@@ -6673,7 +6632,7 @@ async def chat_completions(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_loop_completed",
-            title="MCP loop 完成",
+            title="MCP loop completed",
             preview="run_chat_with_mcp_loop completed",
             payload=summarize_loop_result(result),
         )
@@ -6864,7 +6823,7 @@ async def chat_completions(
             safe_append_event(
                 source="devtools-radar-api",
                 event_type="model_response_error",
-                title="模型請求失敗",
+                title="Model response error",
                 preview=str(result.get("error")),
                 level="error",
                 payload={
@@ -6889,7 +6848,7 @@ async def chat_completions(
         safe_append_event(
             source="devtools-radar-api",
             event_type="model_response_sent",
-            title="送出模型回覆",
+            title="Model response sent",
             preview=(
                 f"duration_ms={duration_ms} "
                 f"stream={req.stream} "
@@ -6903,7 +6862,7 @@ async def chat_completions(
             safe_append_event(
                 source="devtools-radar-api",
                 event_type="mcp_tool_calls_requested",
-                title="模型要求工具呼叫",
+                title="Model requested tool calls",
                 preview=f"tool_calls={len(tool_calls_summary)}",
                 payload={
                     "tool_calls_count": len(tool_calls_summary),
@@ -6916,7 +6875,7 @@ async def chat_completions(
                 safe_append_event(
                     source="mcp-runtime",
                     event_type="mcp_tool_call_requested",
-                    title="MCP 工具呼叫被要求",
+                    title="MCP tool call requested",
                     preview=(
                         f"tool={tool_call_summary.get('name')} "
                         f"index={index}"
@@ -6932,7 +6891,7 @@ async def chat_completions(
             safe_append_event(
                 source="devtools-radar-api",
                 event_type="model_streaming_response_built",
-                title="建立串流回覆",
+                title="Streaming response built",
                 preview="stream=true",
                 payload={
                     "stream": True,
@@ -6956,7 +6915,7 @@ async def chat_completions(
         safe_append_event(
             source="mcp-runtime",
             event_type="mcp_loop_error",
-            title="MCP loop 例外",
+            title="MCP loop exception",
             preview=str(error),
             level="error",
             payload={
@@ -6970,7 +6929,7 @@ async def chat_completions(
         safe_append_event(
             source="devtools-radar-api",
             event_type="model_response_error",
-            title="模型請求例外",
+            title="Model request exception",
             preview=str(error),
             level="error",
             payload=summarize_error(error),
