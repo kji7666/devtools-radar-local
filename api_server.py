@@ -43,6 +43,7 @@ from opencode_ados_trace import (
     build_ados_template_instruction,
     build_ados_workflow_info,
     build_selected_skill_instructions,
+    discover_skills,
     emit_ados_workflow_completed_events,
     emit_ados_workflow_started_events,
     emit_ados_template_injected_event,
@@ -60,8 +61,28 @@ from runtime_event_summarizer import (
     summarize_diff_generated_snapshot,
     summarize_validation_summary,
     summarize_run_summary,
+    summarize_structured_plan,
+    summarize_build_result_capture,
+    summarize_build_steps_detected,
+    summarize_verification_result,
+    summarize_plan_compliance_check,
+    summarize_stage_handoff,
+    summarize_stage_tool_policy,
+    summarize_validation_strategy,
+    summarize_review_result,
+    summarize_skill_request,
+    summarize_audit_artifact,
     build_command_event_preview,
     build_validation_summary_preview,
+    build_plan_created_preview,
+    build_build_result_preview,
+    build_plan_compliance_preview,
+    build_stage_handoff_preview,
+    build_stage_tool_policy_preview,
+    build_validation_strategy_preview,
+    build_review_result_preview,
+    build_skill_request_preview,
+    build_audit_artifact_preview,
     build_run_summary_preview,
 )
 from runtime_lifecycle_summarizer import (
@@ -99,6 +120,46 @@ MAX_TOTAL_DIFF_PREVIEW_CHARS = 12000
 DEFAULT_MODEL = "chatgpt-web-local"
 SERVER_VERSION = "0.7.0"
 MAX_TOOL_LOOPS = 5
+PBV_REQUIRED_STAGES = ["planner", "builder", "verifier"]
+MUTATING_TOOL_NAMES = {
+    "filesystem__write_file",
+    "filesystem__edit_file",
+    "filesystem__move_file",
+    "apply_patch",
+}
+PASS_LIKE_VALIDATION_PATTERNS = [
+    "tests passed",
+    "test passed",
+    "all tests passed",
+    "all tests pass",
+    "validation passed",
+    "verified successfully",
+    "checks passed",
+    "build passed",
+    "lint passed",
+    "pytest passed",
+    "npm build passed",
+    "tests are passing",
+    "test suite passed",
+    "驗證通過",
+    "測試通過",
+    "檢查通過",
+    "建置通過",
+]
+NEGATIVE_VALIDATION_PATTERNS = [
+    "not run",
+    "not tested",
+    "tests were not run",
+    "validation was not run",
+    "no validation command was executed",
+    "no validation was run",
+    "unverified",
+    "not verified",
+    "未驗證",
+    "未執行測試",
+    "沒有執行測試",
+    "未執行驗證",
+]
 
 PLAN_BUILD_VERIFY_TRIGGER_PHRASES = [
     "ados-workflow plan-build-verify",
@@ -106,6 +167,51 @@ PLAN_BUILD_VERIFY_TRIGGER_PHRASES = [
     "使用 ados plan-build-verify",
     "使用 ados-workflow plan-build-verify",
 ]
+
+PLAN_BUILD_VERIFY_REVIEW_TRIGGER_PHRASES = [
+    "ados-workflow plan-build-verify-review",
+    "ados plan-build-verify-review",
+    "雿輻 ados plan-build-verify-review",
+    "雿輻 ados-workflow plan-build-verify-review",
+]
+MUTATING_TOOL_HINTS = [
+    "write_file",
+    "edit_file",
+    "move_file",
+    "delete_file",
+    "create_directory",
+    "remove_directory",
+    "apply_patch",
+    "file_write",
+    "file_edit",
+]
+STAGE_TOOL_POLICIES = {
+    "planner": {
+        "mode": "read_only",
+        "allow_mutating_tools": False,
+        "allow_validation_commands": False,
+    },
+    "explorer": {
+        "mode": "read_only",
+        "allow_mutating_tools": False,
+        "allow_validation_commands": False,
+    },
+    "builder": {
+        "mode": "write_allowed",
+        "allow_mutating_tools": True,
+        "allow_validation_commands": False,
+    },
+    "verifier": {
+        "mode": "verify_only",
+        "allow_mutating_tools": False,
+        "allow_validation_commands": True,
+    },
+    "reviewer": {
+        "mode": "review_only",
+        "allow_mutating_tools": False,
+        "allow_validation_commands": False,
+    },
+}
 
 runner_lock = asyncio.Lock()
 pending_mcp_calls: dict[str, dict[str, Any]] = {}
@@ -2815,6 +2921,277 @@ def build_validation_summary_payload(runtime_state: dict[str, Any] | None) -> di
     }
 
 
+def has_real_validation_evidence(validation_summary: dict[str, Any] | None) -> bool:
+    validation_summary = validation_summary or {}
+    return int(validation_summary.get("test_commands_run") or 0) > 0
+
+
+def detect_negative_validation_context(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(pattern in lowered for pattern in NEGATIVE_VALIDATION_PATTERNS)
+
+
+def detect_pass_like_validation_claim(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if detect_negative_validation_context(lowered):
+        return False
+    return any(pattern in lowered for pattern in PASS_LIKE_VALIDATION_PATTERNS)
+
+
+def evaluate_verifier_guard(
+    *,
+    verifier_output: str,
+    final_output: str,
+    validation_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    validation_summary = validation_summary or {}
+    validation_result = str(validation_summary.get("validation_result") or "unknown")
+    has_real_validation = has_real_validation_evidence(validation_summary)
+    pass_like_claim_detected = False
+
+    if validation_result == "not_run" and not has_real_validation:
+        pass_like_claim_detected = (
+            detect_pass_like_validation_claim(verifier_output)
+            or detect_pass_like_validation_claim(final_output)
+        )
+
+    guard_result = "warning" if pass_like_claim_detected else "ok"
+    warnings: list[str] = []
+
+    if pass_like_claim_detected:
+        warnings.append(
+            "Verifier output used pass-like validation language while validation_result=not_run"
+        )
+
+    return {
+        "validation_result": validation_result,
+        "has_real_validation": has_real_validation,
+        "pass_like_claim_detected": pass_like_claim_detected,
+        "guard_result": guard_result,
+        "warning": (
+            "Verifier or final response used pass-like language without real validation evidence."
+            if pass_like_claim_detected
+            else ""
+        ),
+        "warnings": warnings,
+    }
+
+
+def detect_successful_mutating_tools(tool_events: list[dict[str, Any]] | None) -> dict[str, Any]:
+    tool_events = list(tool_events or [])
+    successful = [
+        item for item in tool_events
+        if item.get("success") and item.get("tool_name") in MUTATING_TOOL_NAMES
+    ]
+    return {
+        "successful_mutating_tools_count": len(successful),
+        "successful_mutating_tools": [str(item.get("tool_name") or "") for item in successful],
+    }
+
+
+def decide_pbv_stage_failure_policy(
+    *,
+    stage: str,
+    stage_status: str,
+    output_text: str = "",
+    changed_files_count: int = 0,
+    successful_mutating_tools_count: int = 0,
+) -> dict[str, Any]:
+    usable_output = bool(str(output_text or "").strip())
+
+    if stage == "planner":
+        if stage_status == "partial" and usable_output:
+            return {
+                "decision": "continue_to_builder",
+                "reason": "planner_partial_with_output",
+                "continue_to_next_stage": True,
+                "workflow_status": "partial",
+            }
+        if stage_status in {"partial", "failed", "error"}:
+            return {
+                "decision": "stop_workflow",
+                "reason": "planner_unusable_or_failed",
+                "continue_to_next_stage": False,
+                "workflow_status": "error",
+            }
+
+    if stage == "builder":
+        if stage_status == "partial" and (
+            changed_files_count > 0 or successful_mutating_tools_count > 0
+        ):
+            return {
+                "decision": "continue_to_verifier",
+                "reason": "builder_partial_with_changes",
+                "continue_to_next_stage": True,
+                "workflow_status": "partial",
+            }
+        if stage_status == "partial":
+            return {
+                "decision": "skip_verifier",
+                "reason": "builder_partial_without_changes",
+                "continue_to_next_stage": False,
+                "workflow_status": "partial",
+            }
+        if stage_status in {"failed", "error"} and (
+            changed_files_count > 0 or successful_mutating_tools_count > 0
+        ):
+            return {
+                "decision": "continue_to_verifier",
+                "reason": "builder_failed_with_changes",
+                "continue_to_next_stage": True,
+                "workflow_status": "partial",
+            }
+        if stage_status in {"failed", "error"}:
+            return {
+                "decision": "stop_workflow",
+                "reason": "builder_failed_without_changes",
+                "continue_to_next_stage": False,
+                "workflow_status": "error",
+            }
+
+    if stage == "verifier" and stage_status in {"partial", "failed"}:
+        return {
+            "decision": "mark_partial",
+            "reason": "verifier_partial",
+            "continue_to_next_stage": False,
+            "workflow_status": "partial",
+        }
+
+    if stage == "verifier" and stage_status == "error":
+        return {
+            "decision": "mark_error",
+            "reason": "verifier_error",
+            "continue_to_next_stage": False,
+            "workflow_status": "error",
+        }
+
+    return {
+        "decision": "continue",
+        "reason": f"{stage}_completed",
+        "continue_to_next_stage": True,
+        "workflow_status": "unknown",
+    }
+
+
+def derive_workflow_status(
+    *,
+    workflow_mode: str,
+    stage_statuses: dict[str, str] | None,
+    completed_stages: list[str] | None,
+    failed_stages: list[str] | None,
+    skipped_stages: list[str] | None,
+    changed_files_count: int,
+    validation_summary: dict[str, Any] | None,
+    warnings: list[str] | None,
+    runner_error: Any,
+    model_response_sent: bool,
+) -> dict[str, str]:
+    stage_statuses = dict(stage_statuses or {})
+    completed_stages = list(completed_stages or [])
+    failed_stages = list(failed_stages or [])
+    skipped_stages = list(skipped_stages or [])
+    validation_summary = validation_summary or {}
+    warnings = list(warnings or [])
+
+    validation_result = str(validation_summary.get("validation_result") or "unknown")
+    failed_commands = int(validation_summary.get("failed_commands") or 0)
+    all_required_completed = all(
+        stage_statuses.get(stage) == "completed"
+        for stage in (PBV_REQUIRED_STAGES if workflow_mode == "plan_build_verify" else [])
+    ) if workflow_mode == "plan_build_verify" else False
+    any_partial = any(status == "partial" for status in stage_statuses.values())
+    any_error = any(status == "error" for status in stage_statuses.values())
+
+    if runner_error and not completed_stages:
+        return {
+            "workflow_status": "error",
+            "final_status": "error",
+            "status_reason": "Runner or backend error prevented a usable workflow result.",
+        }
+
+    if validation_result == "fail" or failed_commands > 0:
+        return {
+            "workflow_status": "failed",
+            "final_status": "failed",
+            "status_reason": "Real validation or command evidence reported failure.",
+        }
+
+    if workflow_mode == "plan_build_verify":
+        if all_required_completed:
+            if warnings:
+                return {
+                    "workflow_status": "completed_with_warnings",
+                    "final_status": "completed_with_warnings",
+                    "status_reason": "All PBV stages completed but warnings were recorded.",
+                }
+            if validation_result == "pass":
+                return {
+                    "workflow_status": "completed",
+                    "final_status": "completed",
+                    "status_reason": "All PBV stages completed and real validation passed.",
+                }
+            if validation_result == "not_run":
+                return {
+                    "workflow_status": "completed_unverified",
+                    "final_status": "completed_unverified",
+                    "status_reason": "All PBV stages completed but no validation command was run.",
+                }
+            return {
+                "workflow_status": "completed_with_warnings",
+                "final_status": "completed_with_warnings",
+                "status_reason": "All PBV stages completed but validation evidence is incomplete.",
+            }
+
+        if completed_stages or any_partial or failed_stages or skipped_stages:
+            if any_error and not changed_files_count and not model_response_sent:
+                return {
+                    "workflow_status": "error",
+                    "final_status": "error",
+                    "status_reason": "A PBV stage failed before a useful result was produced.",
+                }
+            return {
+                "workflow_status": "partial",
+                "final_status": "partial",
+                "status_reason": "At least one PBV stage completed, but the full workflow did not complete cleanly.",
+            }
+
+    if warnings:
+        return {
+            "workflow_status": "completed_with_warnings",
+            "final_status": "completed_with_warnings",
+            "status_reason": "Warnings were recorded for this run.",
+        }
+
+    if any_error:
+        return {
+            "workflow_status": "error",
+            "final_status": "error",
+            "status_reason": "A workflow stage reported an unrecoverable error.",
+        }
+
+    if model_response_sent and changed_files_count and validation_result == "not_run":
+        return {
+            "workflow_status": "completed_unverified",
+            "final_status": "completed_unverified",
+            "status_reason": "The response completed, but changed files were not validated.",
+        }
+
+    if model_response_sent:
+        return {
+            "workflow_status": "completed",
+            "final_status": "completed",
+            "status_reason": "The run completed successfully.",
+        }
+
+    return {
+        "workflow_status": "unknown",
+        "final_status": "unknown",
+        "status_reason": "The workflow ended without enough evidence to classify the result.",
+    }
+
+
 def build_run_summary_payload(
     *,
     run_id: str,
@@ -2831,25 +3208,23 @@ def build_run_summary_payload(
     changed_files = list(git_diff_delta.get("changed_files") or [])
     untracked_files = list(git_diff_delta.get("untracked_files") or [])
     runner_error = runtime_state.get("runner_error")
+    warnings = list(runtime_state.get("warnings") or [])
 
     model_response_sent = bool(runtime_state.get("model_response_sent"))
-
-    if model_response_sent and not runner_error:
-        final_status = "completed"
-    elif runner_error and not model_response_sent:
-        final_status = "error"
-    elif (
-        runtime_state.get("tool_calls_count")
-        or changed_files
-        or runtime_state.get("commands")
-    ) and not model_response_sent:
-        final_status = "partial"
-    else:
-        final_status = "unknown"
-
-    workflow_status = str(runtime_state.get("workflow_status") or "")
-    if runtime_state.get("workflow_mode") == "plan_build_verify" and workflow_status in {"completed", "partial", "error"}:
-        final_status = workflow_status
+    status_info = derive_workflow_status(
+        workflow_mode=str(runtime_state.get("workflow_mode") or ""),
+        stage_statuses=runtime_state.get("stage_statuses"),
+        completed_stages=list(runtime_state.get("completed_stages") or []),
+        failed_stages=list(runtime_state.get("failed_stages") or []),
+        skipped_stages=list(runtime_state.get("skipped_stages") or []),
+        changed_files_count=len(changed_files),
+        validation_summary=validation_summary,
+        warnings=warnings,
+        runner_error=runner_error,
+        model_response_sent=model_response_sent,
+    )
+    final_status = status_info.get("final_status", "unknown")
+    workflow_status = status_info.get("workflow_status", final_status)
 
     return {
         "run_id": run_id,
@@ -2859,6 +3234,7 @@ def build_run_summary_payload(
         "workflow_status": workflow_status or final_status,
         "completed_stages": list(runtime_state.get("completed_stages") or []),
         "failed_stages": list(runtime_state.get("failed_stages") or []),
+        "skipped_stages": list(runtime_state.get("skipped_stages") or []),
         "loaded_skills": list(runtime_state.get("loaded_skills") or []),
         "tool_calls_count": int(runtime_state.get("tool_calls_count") or 0),
         "mcp_internal_tool_calls": int(runtime_state.get("mcp_internal_tool_calls") or 0),
@@ -2872,13 +3248,24 @@ def build_run_summary_payload(
         "test_commands_run": int(validation_summary.get("test_commands_run") or 0),
         "validation_result": str(validation_summary.get("validation_result") or "unknown"),
         "final_status": final_status,
+        "status_reason": status_info.get("status_reason", ""),
+        "warnings": warnings,
+        "warnings_count": len(warnings),
+        "verifier_guard_result": str(runtime_state.get("verifier_guard_result") or "not_applicable"),
+        "validation_strategy": str(runtime_state.get("validation_strategy") or ""),
+        "suggested_validation_commands": list(runtime_state.get("suggested_validation_commands") or []),
+        "suggested_validation_commands_count": len(list(runtime_state.get("suggested_validation_commands") or [])),
+        "requested_skills": list(runtime_state.get("requested_skills") or []),
+        "approved_requested_skills": list(runtime_state.get("approved_requested_skills") or []),
+        "denied_requested_skills": list(runtime_state.get("denied_requested_skills") or []),
+        "review_result": runtime_state.get("review_result") or {},
         "duration_ms": duration_ms,
         "runner_error": runner_error,
         "model_response_sent": model_response_sent,
     }
 
 
-def detect_plan_build_verify_trigger(messages: list[dict[str, Any]] | list[ChatMessage] | None) -> bool:
+def detect_workflow_mode(messages: list[dict[str, Any]] | list[ChatMessage] | None) -> str:
     joined = ""
 
     for message in messages or []:
@@ -2892,16 +3279,28 @@ def detect_plan_build_verify_trigger(messages: list[dict[str, Any]] | list[ChatM
         joined += "\n" + content
 
     lowered = joined.lower()
-    return any(phrase in lowered for phrase in PLAN_BUILD_VERIFY_TRIGGER_PHRASES)
+    if any(phrase in lowered for phrase in PLAN_BUILD_VERIFY_REVIEW_TRIGGER_PHRASES):
+        return "plan_build_verify_review"
+    if any(phrase in lowered for phrase in PLAN_BUILD_VERIFY_TRIGGER_PHRASES):
+        return "plan_build_verify"
+    return ""
 
 
-def build_plan_build_verify_workflow_info() -> dict[str, Any]:
+def detect_plan_build_verify_trigger(messages: list[dict[str, Any]] | list[ChatMessage] | None) -> bool:
+    return detect_workflow_mode(messages) in {"plan_build_verify", "plan_build_verify_review"}
+
+
+def build_plan_build_verify_workflow_info(workflow_mode: str = "plan_build_verify") -> dict[str, Any]:
+    stages = ["planner", "builder", "verifier"]
+    if workflow_mode == "plan_build_verify_review":
+        stages.append("reviewer")
+
     return {
         "workflow_id": f"ados-workflow-{uuid.uuid4().hex[:12]}",
-        "workflow_mode": "plan_build_verify",
+        "workflow_mode": workflow_mode,
         "selected_agent": "ados-workflow",
         "active_stage": "planner",
-        "stages": ["planner", "builder", "verifier"],
+        "stages": stages,
     }
 
 
@@ -2951,8 +3350,822 @@ def extract_response_content_and_tool_calls(result: dict[str, Any]) -> tuple[str
     return content.strip(), len(tool_calls or [])
 
 
+def truncate_preview(text: Any, limit: int = 600) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit]
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in value:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+
+    return normalized
+
+
+def normalize_step_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    steps: list[str] = []
+    seen: set[str] = set()
+
+    for item in value:
+        text = ""
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = str(
+                item.get("id")
+                or item.get("title")
+                or item.get("name")
+                or item.get("step")
+                or ""
+            ).strip()
+            if not text:
+                text = truncate_preview(json.dumps(item, ensure_ascii=False), limit=200)
+        else:
+            text = str(item).strip()
+
+        if not text or text in seen:
+            continue
+
+        seen.add(text)
+        steps.append(text)
+
+    return steps
+
+
+def extract_heading_json_block(text: str, heading: str) -> Any:
+    match = re.search(
+        rf"##\s*{re.escape(heading)}.*?```(?:json)?\s*(.*?)```",
+        str(text or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return try_parse_json(match.group(1).strip())
+
+
+def extract_structured_plan(text: str) -> dict[str, Any]:
+    result = {
+        "parse_status": "not_found",
+        "goal": "",
+        "steps": [],
+        "steps_count": 0,
+        "allowed_files": [],
+        "allowed_files_count": 0,
+        "forbidden_files": [],
+        "forbidden_files_count": 0,
+        "validation_commands": [],
+        "validation_commands_count": 0,
+        "risks": [],
+        "risks_count": 0,
+        "raw_preview": truncate_preview(text, limit=800),
+    }
+
+    parsed = extract_heading_json_block(text, "Structured Plan")
+    if not isinstance(parsed, dict):
+        if str(text or "").strip():
+            result["parse_status"] = "partial"
+        return result
+
+    scope = parsed.get("scope") if isinstance(parsed.get("scope"), dict) else {}
+    validation_value = parsed.get("validation")
+
+    if isinstance(validation_value, dict):
+        validation_commands = normalize_string_list(
+            validation_value.get("commands") or validation_value.get("steps")
+        )
+    else:
+        validation_commands = normalize_string_list(validation_value)
+
+    result.update(
+        {
+            "parse_status": "parsed",
+            "goal": str(parsed.get("goal") or "").strip(),
+            "steps": normalize_step_list(parsed.get("steps")),
+            "allowed_files": normalize_string_list(
+                scope.get("allowed_files") if isinstance(scope, dict) else parsed.get("allowed_files")
+            ),
+            "forbidden_files": normalize_string_list(
+                scope.get("forbidden_files") if isinstance(scope, dict) else parsed.get("forbidden_files")
+            ),
+            "validation_commands": validation_commands,
+            "risks": normalize_string_list(parsed.get("risks")),
+        }
+    )
+
+    result["steps_count"] = len(result["steps"])
+    result["allowed_files_count"] = len(result["allowed_files"])
+    result["forbidden_files_count"] = len(result["forbidden_files"])
+    result["validation_commands_count"] = len(result["validation_commands"])
+    result["risks_count"] = len(result["risks"])
+
+    if not any(
+        [
+            result["goal"],
+            result["steps_count"],
+            result["allowed_files_count"],
+            result["validation_commands_count"],
+            result["risks_count"],
+        ]
+    ):
+        result["parse_status"] = "partial"
+
+    return result
+
+
+def extract_build_result(text: str, plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    result = {
+        "parse_status": "not_found",
+        "completed_steps": [],
+        "completed_steps_count": 0,
+        "skipped_steps": [],
+        "skipped_steps_count": 0,
+        "failed_steps": [],
+        "failed_steps_count": 0,
+        "changed_files": [],
+        "changed_files_count": 0,
+        "notes_preview": "",
+    }
+
+    parsed = extract_heading_json_block(text, "Build Result")
+    if isinstance(parsed, dict):
+        result.update(
+            {
+                "parse_status": "parsed",
+                "completed_steps": normalize_step_list(parsed.get("completed_steps")),
+                "skipped_steps": normalize_step_list(parsed.get("skipped_steps")),
+                "failed_steps": normalize_step_list(parsed.get("failed_steps")),
+                "changed_files": normalize_string_list(parsed.get("changed_files")),
+                "notes_preview": truncate_preview(parsed.get("notes"), limit=400),
+            }
+        )
+    else:
+        step_results_match = re.search(
+            r"##\s*Step Results(.*?)(?:\n##\s|\Z)",
+            str(text or ""),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if step_results_match:
+            completed_steps: list[str] = []
+            skipped_steps: list[str] = []
+            failed_steps: list[str] = []
+
+            for raw_line in step_results_match.group(1).splitlines():
+                line = raw_line.strip()
+                bullet_match = re.match(r"[-*]\s*(.+?)\s*:\s*(completed|skipped|failed)\b", line, flags=re.IGNORECASE)
+                if not bullet_match:
+                    continue
+                step_name = bullet_match.group(1).strip()
+                step_status = bullet_match.group(2).lower()
+                if step_status == "completed":
+                    completed_steps.append(step_name)
+                elif step_status == "skipped":
+                    skipped_steps.append(step_name)
+                else:
+                    failed_steps.append(step_name)
+
+            if completed_steps or skipped_steps or failed_steps:
+                result.update(
+                    {
+                        "parse_status": "partial",
+                        "completed_steps": normalize_step_list(completed_steps),
+                        "skipped_steps": normalize_step_list(skipped_steps),
+                        "failed_steps": normalize_step_list(failed_steps),
+                    }
+                )
+            elif str(text or "").strip():
+                result["parse_status"] = "partial"
+        elif str(text or "").strip():
+            result["parse_status"] = "partial"
+
+    result["completed_steps_count"] = len(result["completed_steps"])
+    result["skipped_steps_count"] = len(result["skipped_steps"])
+    result["failed_steps_count"] = len(result["failed_steps"])
+    result["changed_files_count"] = len(result["changed_files"])
+
+    if plan and not result["completed_steps"] and str(text or "").strip():
+        result["notes_preview"] = truncate_preview(text, limit=400)
+
+    return result
+
+
+def compare_build_to_plan(plan: dict[str, Any] | None, build_result: dict[str, Any] | None) -> dict[str, Any]:
+    planned_steps = normalize_step_list((plan or {}).get("steps"))
+    completed_steps = normalize_step_list((build_result or {}).get("completed_steps"))
+
+    missing_steps = [step for step in planned_steps if step not in completed_steps]
+    extra_steps = [step for step in completed_steps if step not in planned_steps]
+
+    return {
+        "planned_steps": planned_steps,
+        "planned_steps_count": len(planned_steps),
+        "completed_steps": completed_steps,
+        "completed_steps_count": len(completed_steps),
+        "missing_steps": missing_steps,
+        "missing_steps_count": len(missing_steps),
+        "extra_steps": extra_steps,
+        "extra_steps_count": len(extra_steps),
+    }
+
+
+def path_matches_scope_entry(path: str, scope_entry: str) -> bool:
+    normalized_path = str(path or "").replace("\\", "/").strip().lower()
+    normalized_entry = str(scope_entry or "").replace("\\", "/").strip().lower()
+
+    if not normalized_path or not normalized_entry:
+        return False
+    if normalized_path == normalized_entry:
+        return True
+    if "/" not in normalized_entry and Path(normalized_path).name.lower() == normalized_entry:
+        return True
+    return normalized_path.endswith("/" + normalized_entry)
+
+
+def check_file_scope(plan: dict[str, Any] | None, changed_files: list[str] | None) -> dict[str, Any]:
+    plan = plan or {}
+    changed_files = normalize_string_list(changed_files)
+    allowed_files = normalize_string_list(plan.get("allowed_files"))
+    forbidden_files = normalize_string_list(plan.get("forbidden_files"))
+
+    unexpected_files = []
+    if allowed_files:
+        unexpected_files = [
+            path for path in changed_files
+            if not any(path_matches_scope_entry(path, allowed) for allowed in allowed_files)
+        ]
+
+    forbidden_files_touched = [
+        path for path in changed_files
+        if any(path_matches_scope_entry(path, forbidden) for forbidden in forbidden_files)
+    ]
+
+    return {
+        "allowed_files": allowed_files,
+        "allowed_files_count": len(allowed_files),
+        "forbidden_files": forbidden_files,
+        "forbidden_files_count": len(forbidden_files),
+        "unexpected_files": unexpected_files,
+        "unexpected_files_count": len(unexpected_files),
+        "forbidden_files_touched": forbidden_files_touched,
+        "forbidden_files_touched_count": len(forbidden_files_touched),
+    }
+
+
+def extract_verification_result(
+    text: str,
+    *,
+    plan: dict[str, Any] | None = None,
+    build_result: dict[str, Any] | None = None,
+    changed_files: list[str] | None = None,
+    validation_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    plan_compare = compare_build_to_plan(plan, build_result)
+    file_scope = check_file_scope(plan, changed_files)
+    validation_summary = validation_summary or {}
+
+    headings_found = all(
+        marker.lower() in str(text or "").lower()
+        for marker in ["## plan compliance", "## file scope", "## validation"]
+    )
+
+    caveats: list[str] = []
+    if int(plan_compare.get("missing_steps_count") or 0) > 0:
+        caveats.append("Builder did not mark all planned steps as completed.")
+    if int(file_scope.get("unexpected_files_count") or 0) > 0:
+        caveats.append("Changed files include paths outside the allowed file scope.")
+    if int(file_scope.get("forbidden_files_touched_count") or 0) > 0:
+        caveats.append("Changed files include forbidden paths.")
+    if str(validation_summary.get("validation_result") or "unknown") == "not_run":
+        caveats.append("No validation command was run.")
+
+    if file_scope.get("forbidden_files_touched_count"):
+        plan_compliance_status = "forbidden_files"
+    elif file_scope.get("unexpected_files_count"):
+        plan_compliance_status = "scope_mismatch"
+    elif plan_compare.get("missing_steps_count"):
+        plan_compliance_status = "partial"
+    elif str(validation_summary.get("validation_result") or "unknown") == "fail":
+        plan_compliance_status = "validation_failed"
+    elif headings_found:
+        plan_compliance_status = "compliant"
+    else:
+        plan_compliance_status = "unknown"
+
+    return {
+        "parse_status": "parsed" if headings_found else ("partial" if str(text or "").strip() else "not_found"),
+        "plan_compliance_status": plan_compliance_status,
+        "completed_steps_count": int(plan_compare.get("completed_steps_count") or 0),
+        "missing_steps_count": int(plan_compare.get("missing_steps_count") or 0),
+        "unexpected_files": list(file_scope.get("unexpected_files") or []),
+        "unexpected_files_count": int(file_scope.get("unexpected_files_count") or 0),
+        "validation_result": str(validation_summary.get("validation_result") or "unknown"),
+        "caveats": caveats,
+    }
+
+
+def build_handoff_payload(
+    *,
+    workflow_info: dict[str, Any],
+    from_stage: str,
+    to_stage: str,
+    from_agent: str,
+    to_agent: str,
+    from_status: str,
+    to_status: str,
+    output_text: str = "",
+    plan: dict[str, Any] | None = None,
+    build_result: dict[str, Any] | None = None,
+    changed_files: list[str] | None = None,
+    diff_preview: str = "",
+    validation_result: str = "unknown",
+) -> dict[str, Any]:
+    plan = plan or {}
+    build_result = build_result or {}
+    changed_files = normalize_string_list(changed_files)
+    output_value = str(output_text or "")
+
+    return {
+        "workflow_mode": workflow_info.get("workflow_mode"),
+        "handoff_id": f"{workflow_info.get('workflow_id')}-{from_stage}-to-{to_stage}",
+        "from_stage": from_stage,
+        "to_stage": to_stage,
+        "from_agent": from_agent,
+        "to_agent": to_agent,
+        "from_status": from_status,
+        "to_status": to_status,
+        "included_plan": bool(plan),
+        "plan_parse_status": str(plan.get("parse_status") or ""),
+        "plan_steps_count": int(plan.get("steps_count") or 0),
+        "included_build_result": bool(build_result),
+        "build_result_parse_status": str(build_result.get("parse_status") or ""),
+        "completed_steps_count": int(build_result.get("completed_steps_count") or 0),
+        "skipped_steps_count": int(build_result.get("skipped_steps_count") or 0),
+        "output_preview_length": len(truncate_preview(output_value, limit=400)),
+        "output_length": len(output_value),
+        "changed_files": changed_files,
+        "changed_files_count": len(changed_files),
+        "diff_preview_length": len(str(diff_preview or "")),
+        "validation_result": validation_result,
+    }
+
+
+def get_stage_tool_policy(stage: str) -> dict[str, Any]:
+    policy = dict(STAGE_TOOL_POLICIES.get(str(stage or "").strip(), {}))
+    if not policy:
+        policy = {
+            "mode": "default",
+            "allow_mutating_tools": True,
+            "allow_validation_commands": True,
+        }
+    return policy
+
+
+def is_mutating_tool_name(tool_name: str) -> bool:
+    normalized = str(tool_name or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in {name.lower() for name in MUTATING_TOOL_NAMES}:
+        return True
+    return any(hint in normalized for hint in MUTATING_TOOL_HINTS)
+
+
+def apply_stage_tool_policy(
+    *,
+    workflow_mode: str,
+    stage: str,
+    agent: str,
+    tool_name: str,
+    command_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    policy = get_stage_tool_policy(stage)
+    mutating = is_mutating_tool_name(tool_name)
+    is_validation_command = bool((command_info or {}).get("is_test_command"))
+
+    reason = ""
+    decision = "allowed"
+    status = "success"
+
+    if mutating and not policy.get("allow_mutating_tools", True):
+        if stage in {"planner", "reviewer"}:
+            decision = "blocked"
+            reason = f"{stage} stage is read-only"
+            status = "error"
+        else:
+            decision = "blocked"
+            reason = f"{stage} stage is read-only except validation commands"
+            status = "error"
+    elif is_validation_command and not policy.get("allow_validation_commands", True):
+        decision = "warning" if stage == "builder" else "blocked"
+        reason = f"{stage} stage does not run validation commands"
+        status = "warning" if decision == "warning" else "error"
+
+    return {
+        "workflow_mode": workflow_mode,
+        "stage": stage,
+        "agent": agent,
+        "tool": str(tool_name or ""),
+        "policy": policy.get("mode", "default"),
+        "allow_mutating_tools": bool(policy.get("allow_mutating_tools", True)),
+        "allow_validation_commands": bool(policy.get("allow_validation_commands", True)),
+        "is_mutating_tool": mutating,
+        "is_validation_command": is_validation_command,
+        "decision": decision,
+        "reason": reason,
+        "status": status,
+    }
+
+
+def emit_stage_tool_policy_selected(*, workflow_mode: str, stage: str, agent: str) -> None:
+    payload = summarize_stage_tool_policy(
+        {
+            "workflow_mode": workflow_mode,
+            "stage": stage,
+            "agent": agent,
+            **get_stage_tool_policy(stage),
+            "decision": "selected",
+            "reason": "",
+            "tool": "",
+        }
+    )
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_stage_tool_policy_selected",
+        title="Stage tool policy selected",
+        preview=build_stage_tool_policy_preview(payload),
+        payload=payload,
+    )
+
+
+def detect_skill_requests(text: str, available_skills: list[str]) -> dict[str, Any]:
+    available_lookup = {skill.lower(): skill for skill in available_skills}
+    requested: list[str] = []
+
+    for match in re.findall(r"REQUEST_SKILL:\s*([A-Za-z0-9_-]+)", str(text or ""), flags=re.IGNORECASE):
+        requested.append(match.strip())
+
+    requested_section = re.search(
+        r"##\s*Requested Skills(.*?)(?:\n##\s|\Z)",
+        str(text or ""),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if requested_section:
+        for raw_line in requested_section.group(1).splitlines():
+            line = raw_line.strip()
+            match = re.match(r"[-*]\s*([A-Za-z0-9_-]+)", line)
+            if match:
+                requested.append(match.group(1).strip())
+
+    deduped: list[str] = []
+    for skill in requested:
+        normalized = skill.strip()
+        if normalized and normalized not in deduped:
+            deduped.append(normalized)
+
+    approved = [available_lookup[item.lower()] for item in deduped if item.lower() in available_lookup]
+    denied = [item for item in deduped if item.lower() not in available_lookup]
+
+    return {
+        "requested_skills": deduped,
+        "approved_skills": approved,
+        "denied_skills": denied,
+    }
+
+
+def load_requested_skill_instructions(skill_names: list[str]) -> str:
+    available = {item["name"]: item for item in discover_skills() if item.get("name")}
+    parts: list[str] = []
+
+    for skill_name in normalize_string_list(skill_names):
+        skill = available.get(skill_name)
+        if not skill:
+            continue
+        skill_path = BASE_DIR / str(skill.get("path") or "").replace("/", "\\")
+        try:
+            content = skill_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if not content.strip():
+            continue
+        parts.append(
+            (
+                f"[REQUESTED SKILL ACTIVE]\n"
+                f"Skill name: {skill_name}\n"
+                f"Skill path: {skill.get('path')}\n\n"
+                f"{content}"
+            ).strip()
+        )
+
+    return "\n\n---\n\n".join(parts).strip()
+
+
+def emit_skill_request_events(
+    *,
+    workflow_mode: str,
+    stage: str,
+    agent: str,
+    output_text: str,
+    available_skills: list[str],
+    runtime_state: dict[str, Any],
+) -> None:
+    skill_request = detect_skill_requests(output_text, available_skills)
+    if not skill_request.get("requested_skills"):
+        return
+
+    request_payload = summarize_skill_request(
+        {
+            "workflow_mode": workflow_mode,
+            "stage": stage,
+            "agent": agent,
+            "requested_skills": skill_request.get("requested_skills"),
+            "approved_skills": skill_request.get("approved_skills"),
+            "denied_skills": skill_request.get("denied_skills"),
+            "source": "model_output",
+        }
+    )
+    runtime_state["requested_skills"] = normalize_string_list(
+        list(runtime_state.get("requested_skills") or []) + list(request_payload.get("requested_skills") or [])
+    )
+    runtime_state["approved_requested_skills"] = normalize_string_list(
+        list(runtime_state.get("approved_requested_skills") or []) + list(request_payload.get("approved_skills") or [])
+    )
+    runtime_state["denied_requested_skills"] = normalize_string_list(
+        list(runtime_state.get("denied_requested_skills") or []) + list(request_payload.get("denied_skills") or [])
+    )
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_skill_requested",
+        title="Skill requested",
+        preview=build_skill_request_preview(request_payload),
+        payload=request_payload,
+    )
+    for skill_name in request_payload.get("approved_skills") or []:
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_skill_request_approved",
+            title="Skill request approved",
+            preview=f"skill={skill_name} decision=approved",
+            payload={"stage": stage, "skill": skill_name, "decision": "approved", "reason": "known skill"},
+        )
+    for skill_name in request_payload.get("denied_skills") or []:
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_skill_request_denied",
+            title="Skill request denied",
+            preview=f"skill={skill_name} decision=denied",
+            payload={"stage": stage, "skill": skill_name, "decision": "denied", "reason": "skill not found"},
+            status="warning",
+        )
+
+
+def suggest_validation_strategy(changed_files: list[str], project_root: Path) -> dict[str, Any]:
+    normalized = normalize_string_list(changed_files)
+    python_files = [path for path in normalized if path.lower().endswith(".py")]
+    frontend_files = [
+        path for path in normalized
+        if path.replace("\\", "/").startswith("app-agent-console/")
+        and any(path.lower().endswith(ext) for ext in [".js", ".jsx", ".ts", ".tsx", ".css", ".scss", ".html"])
+    ]
+    review_only_files = bool(normalized) and all(
+        path.lower().endswith(".md") or path.replace("\\", "/").startswith(".opencode/")
+        for path in normalized
+    )
+
+    commands: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    strategy = "no_changes"
+
+    if python_files:
+        strategy = "python_backend"
+        for path in python_files:
+            commands.append(
+                {
+                    "command": f"python -m py_compile {path}",
+                    "reason": "Python backend file changed",
+                }
+            )
+
+    if frontend_files:
+        strategy = "mixed_backend_frontend" if commands else "frontend"
+        if (project_root / "app-agent-console" / "package.json").exists():
+            commands.append(
+                {
+                    "command": "cd app-agent-console && cmd /c npm run build",
+                    "reason": "Frontend files changed",
+                }
+            )
+        else:
+            skipped.append(
+                {
+                    "command": "cd app-agent-console && cmd /c npm run build",
+                    "reason": "package.json not found",
+                }
+            )
+
+    if review_only_files and not commands:
+        strategy = "review_only"
+        skipped.append(
+            {
+                "command": "",
+                "reason": "Only docs or ADOS prompt files changed",
+            }
+        )
+
+    if not normalized and not commands:
+        strategy = "no_changes"
+        skipped.append(
+            {
+                "command": "",
+                "reason": "No changed files detected",
+            }
+        )
+
+    seen_commands: set[str] = set()
+    unique_commands: list[dict[str, str]] = []
+    for item in commands:
+        command = item["command"]
+        if command in seen_commands:
+            continue
+        seen_commands.add(command)
+        unique_commands.append(item)
+
+    if commands and strategy == "python_backend" and frontend_files:
+        strategy = "mixed_backend_frontend"
+
+    return {
+        "strategy": strategy,
+        "auto_run": False,
+        "commands": unique_commands,
+        "commands_count": len(unique_commands),
+        "skipped_commands": skipped,
+        "changed_files_count": len(normalized),
+    }
+
+
+def extract_review_result(text: str, validation_result: str = "unknown") -> dict[str, Any]:
+    lowered = str(text or "").lower()
+
+    def detect_value(label: str, allowed: list[str], default: str = "unknown") -> str:
+        match = re.search(rf"{re.escape(label.lower())}\s*:\s*([a-z_]+)", lowered)
+        if match and match.group(1) in allowed:
+            return match.group(1)
+        return default
+
+    parse_status = "parsed" if "## review" in lowered else ("partial" if lowered.strip() else "not_found")
+    return {
+        "parse_status": parse_status,
+        "risk": detect_value("risk", ["low", "medium", "high"]),
+        "commit_readiness": detect_value("commit readiness", ["ready", "not_ready", "needs_human_review"]),
+        "scope_control": detect_value("scope control", ["ok", "warning", "failed"]),
+        "validation_confidence": detect_value(
+            "validation confidence",
+            ["verified", "unverified", "failed"],
+            default="unverified" if validation_result == "not_run" else "unknown",
+        ),
+    }
+
+
+def build_artifact_summary_markdown(manifest: dict[str, Any]) -> str:
+    lines = [
+        "# ADOS Run Summary",
+        "",
+        f"Run: {manifest.get('run_id', '')}",
+        f"Workflow: {manifest.get('workflow_mode', '')}",
+        f"Status: {manifest.get('status', '')}",
+        f"Validation: {manifest.get('validation_result', '')}",
+        "",
+        "## Stages",
+        "",
+        "| Stage | Agent | Status | Tools | Output |",
+        "|---|---|---|---|---|",
+    ]
+
+    for stage in manifest.get("stages") or []:
+        tool_names = ", ".join(stage.get("tools") or []) or "-"
+        lines.append(
+            f"| {stage.get('stage', '')} | {stage.get('agent', '')} | {stage.get('status', '')} | {tool_names} | {stage.get('output_length', 0)} |"
+        )
+
+    lines.extend(["", "## Changed Files", ""])
+    changed_files = manifest.get("changed_files") or []
+    if changed_files:
+        lines.extend([f"- {path}" for path in changed_files])
+    else:
+        lines.append("- (none)")
+
+    lines.extend(["", "## Suggested Validation", ""])
+    suggested_commands = manifest.get("suggested_validation_commands") or []
+    if suggested_commands:
+        lines.extend(["```powershell", *suggested_commands, "```"])
+    else:
+        lines.append("No command suggested.")
+
+    lines.extend(["", "## Warnings", ""])
+    warnings = manifest.get("warnings") or []
+    if warnings:
+        lines.extend([f"- {warning}" for warning in warnings])
+    else:
+        lines.append("- (none)")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_ados_run_artifacts(
+    run_id: str,
+    workflow_state: dict[str, Any],
+    outputs: dict[str, str],
+    root: Path,
+) -> dict[str, Any]:
+    runs_root = root / ".opencode" / "runs"
+    run_dir = runs_root / run_id
+    runs_root.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    stage_statuses = dict(workflow_state.get("stage_statuses") or {})
+    stage_agents = dict(workflow_state.get("stage_agents") or {})
+    stage_tools = dict(workflow_state.get("stage_tool_names") or {})
+    changed_files = normalize_string_list(workflow_state.get("changed_files") or [])
+    suggested_validation_commands = normalize_string_list(workflow_state.get("suggested_validation_commands") or [])
+    artifacts: dict[str, str] = {}
+    files_written: list[str] = []
+
+    for stage_name, filename in [("planner", "plan.md"), ("builder", "build.md"), ("verifier", "verify.md"), ("reviewer", "review.md")]:
+        output_text = str(outputs.get(stage_name) or "").strip()
+        if not output_text:
+            continue
+        path = run_dir / filename
+        path.write_text(output_text + "\n", encoding="utf-8")
+        artifacts[stage_name] = filename
+        files_written.append(filename)
+
+    diff_preview = str(workflow_state.get("diff_preview") or "")
+    if diff_preview:
+        diff_name = "diff_preview.txt"
+        (run_dir / diff_name).write_text(diff_preview, encoding="utf-8")
+        artifacts["diff_preview"] = diff_name
+        files_written.append(diff_name)
+
+    manifest = {
+        "run_id": run_id,
+        "workflow_mode": workflow_state.get("workflow_mode", ""),
+        "started_at": workflow_state.get("started_at", ""),
+        "finished_at": workflow_state.get("finished_at", ""),
+        "status": workflow_state.get("workflow_status") or workflow_state.get("final_status") or "unknown",
+        "stages": [
+            {
+                "stage": stage,
+                "agent": stage_agents.get(stage, ""),
+                "status": stage_statuses.get(stage, ""),
+                "output_length": len(str(outputs.get(stage) or "")),
+                "tools": stage_tools.get(stage, []),
+            }
+            for stage in workflow_state.get("workflow_info", {}).get("stages", [])
+            if stage in outputs or stage in stage_statuses
+        ],
+        "changed_files": changed_files,
+        "validation_result": workflow_state.get("validation_result", "unknown"),
+        "suggested_validation_commands": suggested_validation_commands,
+        "warnings": list(workflow_state.get("warnings") or []),
+        "artifacts": artifacts,
+    }
+
+    manifest_name = "run_manifest.json"
+    (run_dir / manifest_name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    files_written.append(manifest_name)
+    artifacts["manifest"] = manifest_name
+
+    summary_name = "summary.md"
+    (run_dir / summary_name).write_text(build_artifact_summary_markdown(manifest), encoding="utf-8")
+    files_written.append(summary_name)
+    artifacts["summary"] = summary_name
+
+    manifest["artifacts"] = artifacts
+    (run_dir / manifest_name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "run_id": run_id,
+        "directory": str(run_dir.relative_to(root)).replace("\\", "/"),
+        "files": files_written,
+        "files_count": len(files_written),
+    }
+
+
 def merge_runtime_state(shared_state: dict[str, Any], stage_state: dict[str, Any]) -> None:
     shared_state.setdefault("commands", []).extend(list(stage_state.get("commands") or []))
+    shared_state.setdefault("tool_events", []).extend(list(stage_state.get("tool_events") or []))
     shared_state["tool_calls_count"] = int(shared_state.get("tool_calls_count") or 0) + int(stage_state.get("tool_calls_count") or 0)
     shared_state["mcp_internal_tool_calls"] = int(shared_state.get("mcp_internal_tool_calls") or 0) + int(stage_state.get("mcp_internal_tool_calls") or 0)
     shared_state["mcp_external_tool_calls"] = int(shared_state.get("mcp_external_tool_calls") or 0) + int(stage_state.get("mcp_external_tool_calls") or 0)
@@ -2963,6 +4176,12 @@ def merge_runtime_state(shared_state: dict[str, Any], stage_state: dict[str, Any
             existing_skills.append(skill)
     shared_state["loaded_skills"] = existing_skills
 
+    existing_warnings = list(shared_state.get("warnings") or [])
+    for warning in list(stage_state.get("warnings") or []):
+        if warning not in existing_warnings:
+            existing_warnings.append(warning)
+    shared_state["warnings"] = existing_warnings
+
 
 def emit_plan_build_verify_workflow_started(workflow_info: dict[str, Any]) -> None:
     safe_append_event(
@@ -2971,6 +4190,34 @@ def emit_plan_build_verify_workflow_started(workflow_info: dict[str, Any]) -> No
         title="ADOS workflow started",
         preview="workflow=plan_build_verify agent=ados-workflow stage=planner",
         payload=workflow_info,
+    )
+
+
+def emit_pbv_stage_failure_policy_applied(
+    *,
+    workflow_info: dict[str, Any],
+    stage: str,
+    stage_status: str,
+    changed_files_count: int,
+    successful_write_tools_count: int,
+    decision: str,
+    reason: str,
+) -> None:
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_stage_failure_policy_applied",
+        title="ADOS stage failure policy applied",
+        preview=f"stage={stage} decision={decision} reason={reason}",
+        payload={
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "workflow_id": workflow_info.get("workflow_id"),
+            "stage": stage,
+            "stage_status": stage_status,
+            "changed_files_count": changed_files_count,
+            "successful_write_tools_count": successful_write_tools_count,
+            "decision": decision,
+            "reason": reason,
+        },
     )
 
 
@@ -2988,6 +4235,11 @@ def emit_plan_build_verify_stage_started(workflow_info: dict[str, Any], stage: s
             "stage": stage,
             "agent": agent,
         },
+    )
+    emit_stage_tool_policy_selected(
+        workflow_mode=str(workflow_info.get("workflow_mode") or ""),
+        stage=stage,
+        agent=agent,
     )
 
 
@@ -3018,6 +4270,17 @@ def emit_plan_build_verify_stage_finished(
         preview=f"stage={stage} status={status}",
         payload=payload,
         status="error" if status == "error" else "success",
+    )
+
+
+def emit_pbv_stage_handoff_created(payload: dict[str, Any]) -> None:
+    payload = summarize_stage_handoff(payload)
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_stage_handoff_created",
+        title="ADOS stage handoff created",
+        preview=build_stage_handoff_preview(payload),
+        payload=payload,
     )
 
 
@@ -3062,8 +4325,9 @@ async def run_plan_build_verify_workflow(
     req: ChatCompletionRequest,
     runtime_state: dict[str, Any],
     git_diff_baseline: dict[str, Any],
+    workflow_mode: str = "plan_build_verify",
 ) -> dict[str, Any]:
-    workflow_info = build_plan_build_verify_workflow_info()
+    workflow_info = build_plan_build_verify_workflow_info(workflow_mode)
     runtime_state["workflow_mode"] = workflow_info["workflow_mode"]
     runtime_state["selected_agent"] = workflow_info["selected_agent"]
     runtime_state["active_stage"] = "planner"
@@ -3072,6 +4336,24 @@ async def run_plan_build_verify_workflow(
     runtime_state["failed_stages"] = []
     runtime_state["skipped_stages"] = []
     runtime_state["workflow_status"] = "unknown"
+    runtime_state["warnings"] = []
+    runtime_state["verifier_guard_result"] = "not_applicable"
+    runtime_state["stage_statuses"] = {}
+    runtime_state.setdefault("tool_events", [])
+    runtime_state["structured_plan"] = {}
+    runtime_state["build_result"] = {}
+    runtime_state["build_plan_compare"] = {}
+    runtime_state["verification_result"] = {}
+    runtime_state["file_scope_check"] = {}
+    runtime_state["review_result"] = {}
+    runtime_state["requested_skills"] = []
+    runtime_state["approved_requested_skills"] = []
+    runtime_state["denied_requested_skills"] = []
+    runtime_state["suggested_validation_commands"] = []
+    runtime_state["validation_strategy"] = ""
+    runtime_state["stage_outputs"] = {}
+    runtime_state["stage_agents"] = {}
+    runtime_state["stage_tool_names"] = {}
 
     emit_plan_build_verify_workflow_started(workflow_info)
 
@@ -3079,38 +4361,63 @@ async def run_plan_build_verify_workflow(
         "You are the planner stage.\n"
         "Do not edit files.\n"
         "Do not run destructive actions.\n"
-        "Return a concise plan with:\n"
+        "Return a concise plan and include a section titled '## Structured Plan'.\n"
+        "Inside that section, include one fenced JSON block with keys:\n"
         "- goal\n"
-        "- files likely to change\n"
+        "- scope.allowed_files\n"
+        "- scope.forbidden_files\n"
+        "- steps\n"
+        "- validation\n"
         "- risks\n"
-        "- suggested verification"
+        "Keep the JSON valid and concise."
     )
     builder_instruction = (
         "You are the builder stage.\n"
         "Use the planner output as guidance.\n"
         "Implement only the required file changes.\n"
         "Keep changes small and reviewable.\n"
-        "Do not claim validation passed unless a real validation command ran."
+        "Do not claim validation passed unless a real validation command ran.\n"
+        "At the end, include '## Build Result' with one fenced JSON block containing:\n"
+        "- completed_steps\n"
+        "- skipped_steps\n"
+        "- failed_steps\n"
+        "- changed_files\n"
+        "- notes\n"
+        "If JSON is not practical, include '## Step Results' bullet lines like '- step-id: completed'."
     )
     verifier_instruction = (
         "You are the verifier stage.\n"
-        "Review the planner output, builder output, changed files, diff summary, and validation summary.\n"
+        "Review the planner output, builder output, structured plan summary, build result summary, changed files, diff summary, and validation summary.\n"
         "Do not modify files unless explicitly necessary to fix a verification-only issue.\n"
         "Never claim tests passed unless an actual command/test event exists with exit_code=0.\n"
         "If no validation command ran, report validation_result=not_run.\n"
-        "Return:\n"
-        "- files changed\n"
-        "- validation result\n"
-        "- risks\n"
-        "- whether the task appears complete"
+        "Return sections titled:\n"
+        "- ## Plan Compliance\n"
+        "- ## File Scope\n"
+        "- ## Validation\n"
+        "State whether planned steps were completed, whether only allowed files were touched, and what remains unverified."
+    )
+    reviewer_instruction = (
+        "You are the reviewer stage.\n"
+        "You are read-only and must not modify files.\n"
+        "Review planner, builder, verifier, changed files, diff preview, warnings, and suggested validation commands.\n"
+        "Return a section titled '## Review' containing:\n"
+        "- Scope control: ok | warning | failed\n"
+        "- Risk: low | medium | high\n"
+        "- Validation confidence: verified | unverified | failed\n"
+        "- Commit readiness: ready | not_ready | needs_human_review\n"
+        "- Follow-up suggestions"
     )
 
     planner_output = ""
     builder_output = ""
     verifier_output = ""
+    reviewer_output = ""
+    available_skills = [item.get("name") for item in discover_skills() if item.get("name")]
 
     emit_plan_build_verify_stage_started(workflow_info, "planner", "ados-planner")
-    planner_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    runtime_state["stage_agents"]["planner"] = "ados-planner"
+    planner_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0, "tool_events": [], "warnings": []}
     planner_result = await run_chat_with_mcp_loop(
         build_stage_request(req, stage_agent="ados-planner", stage_instruction=planner_instruction),
         runtime_state=planner_state,
@@ -3123,7 +4430,9 @@ async def run_plan_build_verify_workflow(
         runtime_state["failed_stages"] = ["planner"]
         runtime_state["skipped_stages"] = ["builder", "verifier"]
         runtime_state["active_stage"] = "planner"
+        runtime_state["stage_statuses"]["planner"] = "error"
         runtime_state["workflow_status"] = "error"
+        planner_output = ""
         emit_plan_build_verify_stage_finished(
             workflow_info,
             stage="planner",
@@ -3131,11 +4440,45 @@ async def run_plan_build_verify_workflow(
             status="error",
             output_text=str(planner_result.get("error")),
         )
+        runtime_state["stage_outputs"]["planner"] = planner_output
+        runtime_state["stage_tool_names"]["planner"] = normalize_string_list(
+            [item.get("tool_name") for item in planner_state.get("tool_events") or []]
+        )
+        structured_plan = summarize_structured_plan(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "planner",
+                "agent": "ados-planner",
+                "parse_status": "error",
+                "goal": "",
+                "steps": [],
+                "steps_count": 0,
+                "allowed_files": [],
+                "allowed_files_count": 0,
+                "forbidden_files": [],
+                "forbidden_files_count": 0,
+                "validation_commands": [],
+                "validation_commands_count": 0,
+                "risks": [],
+                "risks_count": 0,
+                "raw_preview": "",
+            }
+        )
+        runtime_state["structured_plan"] = structured_plan
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_plan_created",
+            title="ADOS structured plan created",
+            preview=build_plan_created_preview(structured_plan),
+            payload=structured_plan,
+        )
         return planner_result
 
     planner_output, planner_tool_calls = extract_response_content_and_tool_calls(planner_result)
     planner_status = "partial" if planner_tool_calls else "completed"
-    runtime_state["completed_stages"].append("planner")
+    runtime_state["stage_statuses"]["planner"] = planner_status
+    if planner_status == "completed":
+        runtime_state["completed_stages"].append("planner")
     emit_plan_build_verify_stage_finished(
         workflow_info,
         stage="planner",
@@ -3143,16 +4486,154 @@ async def run_plan_build_verify_workflow(
         status=planner_status,
         output_text=planner_output,
     )
+    runtime_state["stage_outputs"]["planner"] = planner_output
+    runtime_state["stage_tool_names"]["planner"] = normalize_string_list(
+        [item.get("tool_name") for item in planner_state.get("tool_events") or []]
+    )
+    structured_plan = summarize_structured_plan(
+        {
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "stage": "planner",
+            "agent": "ados-planner",
+            **extract_structured_plan(planner_output),
+        }
+    )
+    runtime_state["structured_plan"] = structured_plan
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_plan_created",
+        title="ADOS structured plan created",
+        preview=build_plan_created_preview(structured_plan),
+        payload=structured_plan,
+    )
+    emit_skill_request_events(
+        workflow_mode=str(workflow_info.get("workflow_mode") or ""),
+        stage="planner",
+        agent="ados-planner",
+        output_text=planner_output,
+        available_skills=available_skills,
+        runtime_state=runtime_state,
+    )
+    if planner_status == "completed":
+        emit_pbv_stage_handoff_created(
+            build_handoff_payload(
+                workflow_info=workflow_info,
+                from_stage="planner",
+                to_stage="builder",
+                from_agent="ados-planner",
+                to_agent="ados-builder",
+                from_status=planner_status,
+                to_status="ready",
+                output_text=planner_output,
+                plan=structured_plan,
+                validation_result="not_run",
+            )
+        )
+
+    if planner_status != "completed":
+        planner_policy = decide_pbv_stage_failure_policy(
+            stage="planner",
+            stage_status=planner_status,
+            output_text=planner_output,
+        )
+        runtime_state["workflow_status"] = planner_policy.get("workflow_status", runtime_state.get("workflow_status", "unknown"))
+        emit_pbv_stage_failure_policy_applied(
+            workflow_info=workflow_info,
+            stage="planner",
+            stage_status=planner_status,
+            changed_files_count=0,
+            successful_write_tools_count=0,
+            decision=planner_policy["decision"],
+            reason=planner_policy["reason"],
+        )
+        if planner_policy.get("continue_to_next_stage"):
+            emit_pbv_stage_handoff_created(
+                build_handoff_payload(
+                    workflow_info=workflow_info,
+                    from_stage="planner",
+                    to_stage="builder",
+                    from_agent="ados-planner",
+                    to_agent="ados-builder",
+                    from_status=planner_status,
+                    to_status="ready",
+                    output_text=planner_output,
+                    plan=structured_plan,
+                    validation_result="not_run",
+                )
+            )
+        if not planner_policy.get("continue_to_next_stage"):
+            runtime_state["skipped_stages"] = ["builder", "verifier"]
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_ados_stage_skipped",
+                title="ADOS stage skipped",
+                preview="stage=builder reason=planner_unusable_or_failed",
+                payload={
+                    "workflow_id": workflow_info.get("workflow_id"),
+                    "workflow_mode": workflow_info.get("workflow_mode"),
+                    "selected_agent": workflow_info.get("selected_agent"),
+                    "stage": "builder",
+                    "reason": planner_policy["reason"],
+                },
+            )
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_ados_stage_skipped",
+                title="ADOS stage skipped",
+                preview="stage=verifier reason=planner_unusable_or_failed",
+                payload={
+                    "workflow_id": workflow_info.get("workflow_id"),
+                    "workflow_mode": workflow_info.get("workflow_mode"),
+                    "selected_agent": workflow_info.get("selected_agent"),
+                    "stage": "verifier",
+                    "reason": planner_policy["reason"],
+                },
+            )
+            final_content = (
+                "## Plan\n"
+                f"{planner_output or '(no planner output)'}\n\n"
+                "## Build\n"
+                "(skipped)\n\n"
+                "## Verify\n"
+                "(skipped)\n\n"
+                "## Final Status\n"
+                "error\n\n"
+                "Planner did not produce enough usable output to continue safely."
+            )
+            return make_chat_response(
+                req=req,
+                content=final_content,
+                tool_calls=None,
+                prompt_text=final_content,
+                raw_output=final_content,
+            )
 
     runtime_state["active_stage"] = "builder"
     emit_plan_build_verify_stage_started(workflow_info, "builder", "ados-builder")
-    builder_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    runtime_state["stage_agents"]["builder"] = "ados-builder"
+    builder_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0, "tool_events": [], "warnings": []}
     builder_result = await run_chat_with_mcp_loop(
         build_stage_request(
             req,
             stage_agent="ados-builder",
             stage_instruction=builder_instruction,
-            context_blocks=[f"Planner output:\n{planner_output}"],
+            context_blocks=[
+                f"Planner output:\n{planner_output}",
+                "Structured plan summary:\n"
+                + json.dumps(
+                    {
+                        "goal": structured_plan.get("goal"),
+                        "steps": structured_plan.get("steps") or [],
+                        "allowed_files": structured_plan.get("allowed_files") or [],
+                        "forbidden_files": structured_plan.get("forbidden_files") or [],
+                        "validation_commands": structured_plan.get("validation_commands") or [],
+                        "parse_status": structured_plan.get("parse_status"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                load_requested_skill_instructions(runtime_state.get("approved_requested_skills") or []),
+            ],
         ),
         runtime_state=builder_state,
         emit_workflow_events=False,
@@ -3162,13 +4643,32 @@ async def run_plan_build_verify_workflow(
 
     git_diff_after_builder = capture_git_diff_snapshot()
     builder_delta = build_git_diff_delta(git_diff_baseline, git_diff_after_builder)
+    builder_mutating_tools = detect_successful_mutating_tools(builder_state.get("tool_events"))
+    successful_mutating_tools_count = int(builder_mutating_tools.get("successful_mutating_tools_count") or 0)
+    build_result_summary = summarize_build_result_capture(
+        {
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "stage": "builder",
+            "agent": "ados-builder",
+            **extract_build_result("", structured_plan),
+            "changed_files": builder_delta.get("changed_files") or [],
+            "changed_files_count": len(builder_delta.get("changed_files") or []),
+        }
+    )
+    build_steps_summary = summarize_build_steps_detected(
+        {
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "stage": "builder",
+            "agent": "ados-builder",
+            **compare_build_to_plan(structured_plan, build_result_summary),
+        }
+    )
 
     if isinstance(builder_result, dict) and "error" in builder_result:
-        builder_status = "partial" if builder_delta.get("changed_files") else "error"
+        builder_status = "failed" if builder_delta.get("changed_files") else "error"
         runtime_state["failed_stages"].append("builder")
-        runtime_state["skipped_stages"] = ["verifier"]
         runtime_state["active_stage"] = "builder"
-        runtime_state["workflow_status"] = builder_status
+        runtime_state["stage_statuses"]["builder"] = builder_status
         emit_plan_build_verify_stage_finished(
             workflow_info,
             stage="builder",
@@ -3176,26 +4676,348 @@ async def run_plan_build_verify_workflow(
             status=builder_status,
             output_text=str(builder_result.get("error")),
         )
-        return builder_result
+        build_result_summary = summarize_build_result_capture(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "builder",
+                "agent": "ados-builder",
+                **extract_build_result(str(builder_result.get("error") or ""), structured_plan),
+                "changed_files": builder_delta.get("changed_files") or [],
+                "changed_files_count": len(builder_delta.get("changed_files") or []),
+            }
+        )
+        build_steps_summary = summarize_build_steps_detected(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "builder",
+                "agent": "ados-builder",
+                **compare_build_to_plan(structured_plan, build_result_summary),
+            }
+        )
+        runtime_state["build_result"] = build_result_summary
+        runtime_state["build_plan_compare"] = build_steps_summary
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_build_result_captured",
+            title="ADOS build result captured",
+            preview=build_build_result_preview(build_result_summary),
+            payload=build_result_summary,
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_build_steps_detected",
+            title="ADOS build steps detected",
+            preview=(
+                f"build steps planned={build_steps_summary.get('planned_steps_count', 0)} "
+                f"completed={build_steps_summary.get('completed_steps_count', 0)} "
+                f"missing={build_steps_summary.get('missing_steps_count', 0)}"
+            ),
+            payload=build_steps_summary,
+        )
+        builder_validation_snapshot = build_validation_summary_payload(runtime_state)
+        builder_policy = decide_pbv_stage_failure_policy(
+            stage="builder",
+            stage_status=builder_status,
+            output_text="",
+            changed_files_count=len(builder_delta.get("changed_files") or []),
+            successful_mutating_tools_count=successful_mutating_tools_count,
+        )
+        runtime_state["workflow_status"] = builder_policy.get("workflow_status", builder_status)
+        emit_pbv_stage_failure_policy_applied(
+            workflow_info=workflow_info,
+            stage="builder",
+            stage_status=builder_status,
+            changed_files_count=len(builder_delta.get("changed_files") or []),
+            successful_write_tools_count=successful_mutating_tools_count,
+            decision=builder_policy["decision"],
+            reason=builder_policy["reason"],
+        )
+        if builder_policy.get("continue_to_next_stage"):
+            emit_pbv_stage_handoff_created(
+                build_handoff_payload(
+                    workflow_info=workflow_info,
+                    from_stage="builder",
+                    to_stage="verifier",
+                    from_agent="ados-builder",
+                    to_agent="ados-verifier",
+                    from_status=builder_status,
+                    to_status="ready",
+                    output_text=str(builder_result.get("error") or ""),
+                    plan=structured_plan,
+                    build_result=build_result_summary,
+                    changed_files=builder_delta.get("changed_files") or [],
+                    diff_preview=str(builder_delta.get("diff_preview") or ""),
+                    validation_result=str(builder_validation_snapshot.get("validation_result") or "not_run"),
+                )
+            )
+        if not builder_policy.get("continue_to_next_stage"):
+            runtime_state["skipped_stages"] = ["verifier"]
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_ados_stage_skipped",
+                title="ADOS stage skipped",
+                preview=f"stage=verifier reason={builder_policy['reason']}",
+                payload={
+                    "workflow_id": workflow_info.get("workflow_id"),
+                    "workflow_mode": workflow_info.get("workflow_mode"),
+                    "selected_agent": workflow_info.get("selected_agent"),
+                    "stage": "verifier",
+                    "reason": builder_policy["reason"],
+                },
+            )
+            final_content = (
+                "## Plan\n"
+                f"{planner_output or '(no planner output)'}\n\n"
+                "## Build\n"
+                f"{str(builder_result.get('error') or '(builder failed)')}\n\n"
+                "## Verify\n"
+                "(skipped)\n\n"
+                "## Final Status\n"
+                f"{runtime_state.get('workflow_status') or 'error'}"
+            )
+            return make_chat_response(
+                req=req,
+                content=final_content,
+                tool_calls=None,
+                prompt_text=final_content,
+                raw_output=final_content,
+            )
 
-    builder_output, builder_tool_calls = extract_response_content_and_tool_calls(builder_result)
-    builder_status = "partial" if builder_tool_calls else "completed"
-    runtime_state["completed_stages"].append("builder")
-    emit_plan_build_verify_stage_finished(
-        workflow_info,
+    if isinstance(builder_result, dict) and "error" in builder_result:
+        builder_output = str(builder_result.get("error") or "(builder failed)")
+        builder_validation_snapshot = build_validation_summary_payload(runtime_state)
+    else:
+        builder_output, builder_tool_calls = extract_response_content_and_tool_calls(builder_result)
+        builder_status = "partial" if builder_tool_calls else "completed"
+        runtime_state["stage_statuses"]["builder"] = builder_status
+        if builder_status == "completed":
+            runtime_state["completed_stages"].append("builder")
+        emit_plan_build_verify_stage_finished(
+            workflow_info,
+            stage="builder",
+            agent="ados-builder",
+            status=builder_status,
+            output_text=builder_output,
+        )
+        build_result_summary = summarize_build_result_capture(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "builder",
+                "agent": "ados-builder",
+                **extract_build_result(builder_output, structured_plan),
+                "changed_files": builder_delta.get("changed_files") or [],
+                "changed_files_count": len(builder_delta.get("changed_files") or []),
+            }
+        )
+        build_steps_summary = summarize_build_steps_detected(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "builder",
+                "agent": "ados-builder",
+                **compare_build_to_plan(structured_plan, build_result_summary),
+            }
+        )
+        runtime_state["build_result"] = build_result_summary
+        runtime_state["build_plan_compare"] = build_steps_summary
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_build_result_captured",
+            title="ADOS build result captured",
+            preview=build_build_result_preview(build_result_summary),
+            payload=build_result_summary,
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_build_steps_detected",
+            title="ADOS build steps detected",
+            preview=(
+                f"build steps planned={build_steps_summary.get('planned_steps_count', 0)} "
+                f"completed={build_steps_summary.get('completed_steps_count', 0)} "
+                f"missing={build_steps_summary.get('missing_steps_count', 0)}"
+            ),
+            payload=build_steps_summary,
+        )
+        builder_validation_snapshot = build_validation_summary_payload(runtime_state)
+
+        if builder_status != "completed":
+            builder_policy = decide_pbv_stage_failure_policy(
+                stage="builder",
+                stage_status=builder_status,
+                output_text=builder_output,
+                changed_files_count=len(builder_delta.get("changed_files") or []),
+                successful_mutating_tools_count=successful_mutating_tools_count,
+            )
+            runtime_state["workflow_status"] = builder_policy.get("workflow_status", runtime_state.get("workflow_status", "unknown"))
+            emit_pbv_stage_failure_policy_applied(
+                workflow_info=workflow_info,
+                stage="builder",
+                stage_status=builder_status,
+                changed_files_count=len(builder_delta.get("changed_files") or []),
+                successful_write_tools_count=successful_mutating_tools_count,
+                decision=builder_policy["decision"],
+                reason=builder_policy["reason"],
+            )
+            if builder_policy.get("continue_to_next_stage"):
+                emit_pbv_stage_handoff_created(
+                    build_handoff_payload(
+                        workflow_info=workflow_info,
+                        from_stage="builder",
+                        to_stage="verifier",
+                        from_agent="ados-builder",
+                        to_agent="ados-verifier",
+                        from_status=builder_status,
+                        to_status="ready",
+                        output_text=builder_output,
+                        plan=structured_plan,
+                        build_result=build_result_summary,
+                        changed_files=builder_delta.get("changed_files") or [],
+                        diff_preview=str(builder_delta.get("diff_preview") or ""),
+                        validation_result=str(builder_validation_snapshot.get("validation_result") or "not_run"),
+                    )
+                )
+            if not builder_policy.get("continue_to_next_stage"):
+                runtime_state["skipped_stages"] = ["verifier"]
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_ados_stage_skipped",
+                    title="ADOS stage skipped",
+                    preview=f"stage=verifier reason={builder_policy['reason']}",
+                    payload={
+                        "workflow_id": workflow_info.get("workflow_id"),
+                        "workflow_mode": workflow_info.get("workflow_mode"),
+                        "selected_agent": workflow_info.get("selected_agent"),
+                        "stage": "verifier",
+                        "reason": builder_policy["reason"],
+                    },
+                )
+                final_content = (
+                    "## Plan\n"
+                    f"{planner_output or '(no planner output)'}\n\n"
+                    "## Build\n"
+                    f"{builder_output or '(no builder output)'}\n\n"
+                    "## Verify\n"
+                    "(skipped)\n\n"
+                    "## Final Status\n"
+                    f"{runtime_state.get('workflow_status') or 'partial'}"
+                )
+                return make_chat_response(
+                    req=req,
+                    content=final_content,
+                    tool_calls=None,
+                    prompt_text=final_content,
+                    raw_output=final_content,
+                )
+
+    runtime_state["stage_outputs"]["builder"] = builder_output
+    runtime_state["stage_tool_names"]["builder"] = normalize_string_list(
+        [item.get("tool_name") for item in builder_state.get("tool_events") or []]
+    )
+    emit_skill_request_events(
+        workflow_mode=str(workflow_info.get("workflow_mode") or ""),
         stage="builder",
         agent="ados-builder",
-        status=builder_status,
         output_text=builder_output,
+        available_skills=available_skills,
+        runtime_state=runtime_state,
     )
 
-    validation_snapshot = build_validation_summary_payload(runtime_state)
+    validation_strategy = summarize_validation_strategy(
+        suggest_validation_strategy(
+            list(builder_delta.get("changed_files") or []) + list(builder_delta.get("untracked_files") or []),
+            BASE_DIR,
+        )
+    )
+    runtime_state["validation_strategy"] = validation_strategy.get("strategy", "")
+    runtime_state["suggested_validation_commands"] = [
+        item.get("command", "")
+        for item in validation_strategy.get("commands") or []
+        if item.get("command")
+    ]
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_validation_strategy_selected",
+        title="Validation strategy selected",
+        preview=build_validation_strategy_preview(validation_strategy),
+        payload=validation_strategy,
+    )
+    for command in validation_strategy.get("commands") or []:
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_validation_command_suggested",
+            title="Validation command suggested",
+            preview=f"command={command.get('command', '')[:120]}",
+            payload={
+                "command": command.get("command", ""),
+                "reason": command.get("reason", ""),
+                "auto_run": False,
+            },
+        )
+    for skipped in validation_strategy.get("skipped_commands") or []:
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_validation_command_skipped",
+            title="Validation command skipped",
+            preview=f"reason={skipped.get('reason', '')[:120]}",
+            payload={
+                "command": skipped.get("command", ""),
+                "reason": skipped.get("reason", ""),
+                "auto_run": False,
+                "strategy": validation_strategy.get("strategy", ""),
+            },
+        )
+
+    if builder_status == "completed":
+        emit_pbv_stage_handoff_created(
+            build_handoff_payload(
+                workflow_info=workflow_info,
+                from_stage="builder",
+                to_stage="verifier",
+                from_agent="ados-builder",
+                to_agent="ados-verifier",
+                from_status=builder_status,
+                to_status="ready",
+                output_text=builder_output,
+                plan=structured_plan,
+                build_result=build_result_summary,
+                changed_files=builder_delta.get("changed_files") or [],
+                diff_preview=str(builder_delta.get("diff_preview") or ""),
+                validation_result=str(builder_validation_snapshot.get("validation_result") or "not_run"),
+            )
+        )
+    validation_snapshot = builder_validation_snapshot
     runtime_state["active_stage"] = "verifier"
     emit_plan_build_verify_stage_started(workflow_info, "verifier", "ados-verifier")
-    verifier_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0}
+    runtime_state["stage_agents"]["verifier"] = "ados-verifier"
+    verifier_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0, "tool_events": [], "warnings": []}
     verifier_context = [
         f"Planner output:\n{planner_output}",
         f"Builder output:\n{builder_output or '(no textual builder output)'}",
+        load_requested_skill_instructions(runtime_state.get("approved_requested_skills") or []),
+        "Structured plan summary:\n"
+        + json.dumps(
+            {
+                "goal": structured_plan.get("goal"),
+                "steps": structured_plan.get("steps") or [],
+                "allowed_files": structured_plan.get("allowed_files") or [],
+                "forbidden_files": structured_plan.get("forbidden_files") or [],
+                "validation_commands": structured_plan.get("validation_commands") or [],
+                "parse_status": structured_plan.get("parse_status"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        "Build result summary:\n"
+        + json.dumps(
+            {
+                "parse_status": build_result_summary.get("parse_status"),
+                "completed_steps": build_result_summary.get("completed_steps") or [],
+                "skipped_steps": build_result_summary.get("skipped_steps") or [],
+                "failed_steps": build_result_summary.get("failed_steps") or [],
+                "changed_files": build_result_summary.get("changed_files") or [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         "Changed files summary:\n"
         + json.dumps(
             {
@@ -3207,6 +5029,8 @@ async def run_plan_build_verify_workflow(
             indent=2,
         ),
         "Validation summary:\n" + json.dumps(validation_snapshot, ensure_ascii=False, indent=2),
+        "Suggested validation commands:\n"
+        + json.dumps(runtime_state.get("suggested_validation_commands") or [], ensure_ascii=False, indent=2),
     ]
     verifier_result = await run_chat_with_mcp_loop(
         build_stage_request(
@@ -3225,7 +5049,9 @@ async def run_plan_build_verify_workflow(
         verifier_status = "partial" if builder_delta.get("changed_files") else "error"
         runtime_state["failed_stages"].append("verifier")
         runtime_state["active_stage"] = "verifier"
+        runtime_state["stage_statuses"]["verifier"] = verifier_status
         runtime_state["workflow_status"] = verifier_status
+        verifier_output = ""
         emit_plan_build_verify_stage_finished(
             workflow_info,
             stage="verifier",
@@ -3233,13 +5059,71 @@ async def run_plan_build_verify_workflow(
             status=verifier_status,
             output_text=str(verifier_result.get("error")),
         )
+        runtime_state["stage_outputs"]["verifier"] = verifier_output
+        runtime_state["stage_tool_names"]["verifier"] = normalize_string_list(
+            [item.get("tool_name") for item in verifier_state.get("tool_events") or []]
+        )
+        verification_result_summary = summarize_verification_result(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "verifier",
+                "agent": "ados-verifier",
+                "parse_status": "error",
+                "plan_compliance_status": "unknown",
+                "completed_steps_count": int((build_steps_summary or {}).get("completed_steps_count") or 0),
+                "missing_steps_count": int((build_steps_summary or {}).get("missing_steps_count") or 0),
+                "unexpected_files": [],
+                "unexpected_files_count": 0,
+                "validation_result": str(validation_snapshot.get("validation_result") or "unknown"),
+                "caveats": ["Verifier stage failed before producing a structured result."],
+            }
+        )
+        plan_compliance_summary = summarize_plan_compliance_check(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "verifier",
+                "agent": "ados-verifier",
+                "plan_compliance_status": "unknown",
+                "planned_steps_count": int((build_steps_summary or {}).get("planned_steps_count") or 0),
+                "completed_steps_count": int((build_steps_summary or {}).get("completed_steps_count") or 0),
+                "missing_steps": list((build_steps_summary or {}).get("missing_steps") or []),
+                "missing_steps_count": int((build_steps_summary or {}).get("missing_steps_count") or 0),
+                "unexpected_files": [],
+                "unexpected_files_count": 0,
+                "forbidden_files_touched": [],
+                "forbidden_files_touched_count": 0,
+                "validation_result": str(validation_snapshot.get("validation_result") or "unknown"),
+                "caveats": ["Verifier stage failed before producing a structured result."],
+            }
+        )
+        runtime_state["verification_result"] = verification_result_summary
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_verification_result_captured",
+            title="ADOS verification result captured",
+            preview=build_plan_compliance_preview(
+                {
+                    **verification_result_summary,
+                    "planned_steps_count": plan_compliance_summary.get("planned_steps_count"),
+                }
+            ),
+            payload=verification_result_summary,
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_plan_compliance_checked",
+            title="ADOS plan compliance checked",
+            preview=build_plan_compliance_preview(plan_compliance_summary),
+            payload=plan_compliance_summary,
+        )
         return verifier_result
 
     verifier_output, verifier_tool_calls = extract_response_content_and_tool_calls(verifier_result)
     verifier_status = "partial" if verifier_tool_calls else "completed"
-    runtime_state["completed_stages"].append("verifier")
+    runtime_state["stage_statuses"]["verifier"] = verifier_status
+    if verifier_status == "completed":
+        runtime_state["completed_stages"].append("verifier")
     runtime_state["active_stage"] = "verifier"
-    runtime_state["workflow_status"] = "partial" if ("partial" in [planner_status, builder_status, verifier_status]) else "completed"
     emit_plan_build_verify_stage_finished(
         workflow_info,
         stage="verifier",
@@ -3247,8 +5131,267 @@ async def run_plan_build_verify_workflow(
         status=verifier_status,
         output_text=verifier_output,
     )
+    runtime_state["stage_outputs"]["verifier"] = verifier_output
+    runtime_state["stage_tool_names"]["verifier"] = normalize_string_list(
+        [item.get("tool_name") for item in verifier_state.get("tool_events") or []]
+    )
+    verifier_guard_placeholder = "## Verify\n" + (verifier_output or "(no verifier output)")
+    guard_result = evaluate_verifier_guard(
+        verifier_output=verifier_output,
+        final_output=verifier_guard_placeholder,
+        validation_summary=validation_snapshot,
+    )
+    runtime_state["verifier_guard_result"] = guard_result.get("guard_result", "not_applicable")
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_verifier_guard_checked",
+        title="Verifier guard checked",
+        preview=(
+            f"validation={guard_result.get('validation_result', 'unknown')} "
+            f"guard={guard_result.get('guard_result', 'ok')}"
+        ),
+        payload=guard_result,
+    )
+    if guard_result.get("guard_result") == "warning":
+        runtime_state.setdefault("warnings", []).extend(
+            [warning for warning in guard_result.get("warnings", []) if warning not in runtime_state.get("warnings", [])]
+        )
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_verifier_guard_warning",
+            title="Verifier guard warning",
+            preview=(
+                f"validation={guard_result.get('validation_result', 'unknown')} "
+                f"pass_like_claim={guard_result.get('pass_like_claim_detected', False)}"
+            ),
+            payload=guard_result,
+            status="warning",
+        )
 
-    final_status = runtime_state.get("workflow_status") or "unknown"
+    verification_result_summary = summarize_verification_result(
+        {
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "stage": "verifier",
+            "agent": "ados-verifier",
+            **extract_verification_result(
+                verifier_output,
+                plan=structured_plan,
+                build_result=build_result_summary,
+                changed_files=builder_delta.get("changed_files") or [],
+                validation_summary=validation_snapshot,
+            ),
+        }
+    )
+    file_scope_check = check_file_scope(structured_plan, builder_delta.get("changed_files") or [])
+    plan_compliance_summary = summarize_plan_compliance_check(
+        {
+            "workflow_mode": workflow_info.get("workflow_mode"),
+            "stage": "verifier",
+            "agent": "ados-verifier",
+            "plan_compliance_status": verification_result_summary.get("plan_compliance_status"),
+            "planned_steps_count": build_steps_summary.get("planned_steps_count"),
+            "completed_steps_count": build_steps_summary.get("completed_steps_count"),
+            "missing_steps": build_steps_summary.get("missing_steps") or [],
+            "missing_steps_count": build_steps_summary.get("missing_steps_count"),
+            "unexpected_files": file_scope_check.get("unexpected_files") or [],
+            "unexpected_files_count": file_scope_check.get("unexpected_files_count"),
+            "forbidden_files_touched": file_scope_check.get("forbidden_files_touched") or [],
+            "forbidden_files_touched_count": file_scope_check.get("forbidden_files_touched_count"),
+            "validation_result": validation_snapshot.get("validation_result"),
+            "caveats": verification_result_summary.get("caveats") or [],
+        }
+    )
+    runtime_state["verification_result"] = verification_result_summary
+    runtime_state["file_scope_check"] = file_scope_check
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_verification_result_captured",
+        title="ADOS verification result captured",
+        preview=build_plan_compliance_preview(
+            {
+                **verification_result_summary,
+                "planned_steps_count": build_steps_summary.get("planned_steps_count"),
+            }
+        ),
+        payload=verification_result_summary,
+    )
+    safe_append_event(
+        source="opencode-runtime",
+        event_type="opencode_ados_plan_compliance_checked",
+        title="ADOS plan compliance checked",
+        preview=build_plan_compliance_preview(plan_compliance_summary),
+        payload=plan_compliance_summary,
+    )
+    emit_skill_request_events(
+        workflow_mode=str(workflow_info.get("workflow_mode") or ""),
+        stage="verifier",
+        agent="ados-verifier",
+        output_text=verifier_output,
+        available_skills=available_skills,
+        runtime_state=runtime_state,
+    )
+
+    review_result_summary = {}
+    if workflow_info.get("workflow_mode") == "plan_build_verify_review":
+        emit_pbv_stage_handoff_created(
+            build_handoff_payload(
+                workflow_info=workflow_info,
+                from_stage="verifier",
+                to_stage="reviewer",
+                from_agent="ados-verifier",
+                to_agent="ados-reviewer",
+                from_status=verifier_status,
+                to_status="ready",
+                output_text=verifier_output,
+                plan=structured_plan,
+                build_result=build_result_summary,
+                changed_files=builder_delta.get("changed_files") or [],
+                diff_preview=str(builder_delta.get("diff_preview") or ""),
+                validation_result=str(validation_snapshot.get("validation_result") or "unknown"),
+            )
+        )
+        runtime_state["active_stage"] = "reviewer"
+        emit_plan_build_verify_stage_started(workflow_info, "reviewer", "ados-reviewer")
+        runtime_state["stage_agents"]["reviewer"] = "ados-reviewer"
+        reviewer_state = {"commands": [], "loaded_skills": [], "tool_calls_count": 0, "mcp_internal_tool_calls": 0, "mcp_external_tool_calls": 0, "tool_events": [], "warnings": []}
+        reviewer_context = [
+            f"Planner output:\n{planner_output}",
+            f"Builder output:\n{builder_output or '(no builder output)'}",
+            f"Verifier output:\n{verifier_output or '(no verifier output)'}",
+            "Build result summary:\n" + json.dumps(build_result_summary, ensure_ascii=False, indent=2),
+            "Verification result summary:\n" + json.dumps(verification_result_summary, ensure_ascii=False, indent=2),
+            "Changed files summary:\n"
+            + json.dumps(
+                {
+                    "changed_files": builder_delta.get("changed_files") or [],
+                    "untracked_files": builder_delta.get("untracked_files") or [],
+                    "diff_preview": str(builder_delta.get("diff_preview") or "")[:2000],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            "Validation summary:\n" + json.dumps(validation_snapshot, ensure_ascii=False, indent=2),
+            "Suggested validation commands:\n" + json.dumps(runtime_state.get("suggested_validation_commands") or [], ensure_ascii=False, indent=2),
+            "Warnings:\n" + json.dumps(runtime_state.get("warnings") or [], ensure_ascii=False, indent=2),
+            load_requested_skill_instructions(runtime_state.get("approved_requested_skills") or []),
+        ]
+        reviewer_result = await run_chat_with_mcp_loop(
+            build_stage_request(
+                req,
+                stage_agent="ados-reviewer",
+                stage_instruction=reviewer_instruction,
+                context_blocks=reviewer_context,
+            ),
+            runtime_state=reviewer_state,
+            emit_workflow_events=False,
+            selected_agent_override="ados-reviewer",
+        )
+        merge_runtime_state(runtime_state, reviewer_state)
+
+        if isinstance(reviewer_result, dict) and "error" in reviewer_result:
+            reviewer_status = "partial"
+            runtime_state["failed_stages"].append("reviewer")
+            runtime_state["stage_statuses"]["reviewer"] = reviewer_status
+            reviewer_output = str(reviewer_result.get("error") or "(reviewer error)")
+        else:
+            reviewer_output, reviewer_tool_calls = extract_response_content_and_tool_calls(reviewer_result)
+            reviewer_status = "partial" if reviewer_tool_calls else "completed"
+            runtime_state["stage_statuses"]["reviewer"] = reviewer_status
+            if reviewer_status == "completed":
+                runtime_state["completed_stages"].append("reviewer")
+
+        emit_plan_build_verify_stage_finished(
+            workflow_info,
+            stage="reviewer",
+            agent="ados-reviewer",
+            status=runtime_state["stage_statuses"]["reviewer"],
+            output_text=reviewer_output,
+        )
+        runtime_state["stage_outputs"]["reviewer"] = reviewer_output
+        runtime_state["stage_tool_names"]["reviewer"] = normalize_string_list(
+            [item.get("tool_name") for item in reviewer_state.get("tool_events") or []]
+        )
+        reviewer_parse = extract_review_result(
+            reviewer_output,
+            validation_result=str(validation_snapshot.get("validation_result") or "unknown"),
+        )
+        if isinstance(reviewer_result, dict) and "error" in reviewer_result:
+            reviewer_parse = {
+                "parse_status": "not_found" if not str(reviewer_output or "").strip() else "error",
+                "risk": "unknown",
+                "commit_readiness": "needs_human_review",
+                "scope_control": "unknown",
+                "validation_confidence": "unverified"
+                if str(validation_snapshot.get("validation_result") or "unknown") == "not_run"
+                else "unknown",
+            }
+        review_result_summary = summarize_review_result(
+            {
+                "workflow_mode": workflow_info.get("workflow_mode"),
+                "stage": "reviewer",
+                "agent": "ados-reviewer",
+                "stage_status": runtime_state["stage_statuses"]["reviewer"],
+                **reviewer_parse,
+            }
+        )
+        runtime_state["review_result"] = review_result_summary
+        safe_append_event(
+            source="opencode-runtime",
+            event_type="opencode_ados_review_result_captured",
+            title="ADOS review result captured",
+            preview=build_review_result_preview(review_result_summary),
+            payload=review_result_summary,
+        )
+        emit_skill_request_events(
+            workflow_mode=str(workflow_info.get("workflow_mode") or ""),
+            stage="reviewer",
+            agent="ados-reviewer",
+            output_text=reviewer_output,
+            available_skills=available_skills,
+            runtime_state=runtime_state,
+        )
+        if review_result_summary.get("risk") == "high":
+            runtime_state.setdefault("warnings", []).append("Reviewer marked risk=high.")
+        if review_result_summary.get("commit_readiness") in {"not_ready", "needs_human_review"}:
+            runtime_state.setdefault("warnings", []).append(
+                f"Reviewer marked commit_readiness={review_result_summary.get('commit_readiness')}."
+            )
+
+    status_info = derive_workflow_status(
+        workflow_mode=workflow_info["workflow_mode"],
+        stage_statuses=runtime_state.get("stage_statuses"),
+        completed_stages=runtime_state.get("completed_stages"),
+        failed_stages=runtime_state.get("failed_stages"),
+        skipped_stages=runtime_state.get("skipped_stages"),
+        changed_files_count=len(builder_delta.get("changed_files") or []),
+        validation_summary=validation_snapshot,
+        warnings=runtime_state.get("warnings"),
+        runner_error=runtime_state.get("runner_error"),
+        model_response_sent=True,
+    )
+    runtime_state["workflow_status"] = status_info.get("workflow_status", "unknown")
+    final_status = status_info.get("final_status", "unknown")
+    final_status_reason = status_info.get("status_reason", "")
+    final_status_block = final_status
+    if final_status_reason:
+        final_status_block += f"\n\n{final_status_reason}"
+    if validation_snapshot.get("validation_result") == "not_run":
+        final_status_block += (
+            "\n\nValidation was not run. The file change was made and verifier inspected the result, "
+            "but no command/test validation evidence is available."
+        )
+    suggested_validation_block = ""
+    if validation_snapshot.get("validation_result") == "not_run" and runtime_state.get("suggested_validation_commands"):
+        suggested_validation_block = (
+            "\n\n## Suggested Validation\n"
+            "Validation was not run. Suggested commands:\n\n"
+            "```powershell\n"
+            + "\n".join(runtime_state.get("suggested_validation_commands") or [])
+            + "\n```"
+        )
+    review_block = ""
+    if workflow_info.get("workflow_mode") == "plan_build_verify_review":
+        review_block = "## Review\n" + f"{reviewer_output or '(no reviewer output)'}\n\n"
     final_content = (
         "## Plan\n"
         f"{planner_output or '(no planner output)'}\n\n"
@@ -3256,8 +5399,10 @@ async def run_plan_build_verify_workflow(
         f"{builder_output or '(no builder output)'}\n\n"
         "## Verify\n"
         f"{verifier_output or '(no verifier output)'}\n\n"
+        f"{review_block}"
         "## Final Status\n"
-        f"{final_status}"
+        f"{final_status_block}"
+        f"{suggested_validation_block}"
     )
 
     return make_chat_response(
@@ -3318,6 +5463,10 @@ async def run_chat_with_mcp_loop(
 ) -> dict[str, Any]:
     loop_started_at = time.perf_counter()
     runtime_state = runtime_state if runtime_state is not None else {}
+    runtime_state.setdefault("commands", [])
+    runtime_state.setdefault("tool_events", [])
+    runtime_state.setdefault("warnings", [])
+    runtime_state.setdefault("stage_statuses", {})
 
     safe_append_event(
         source="mcp-runtime",
@@ -3494,6 +5643,58 @@ async def run_chat_with_mcp_loop(
         runtime_state["mcp_external_tool_calls"] = int(runtime_state.get("mcp_external_tool_calls") or 0) + len(external_calls)
         runtime_state["tool_calls_count"] = int(runtime_state.get("tool_calls_count") or 0) + len(executable_calls) + len(external_calls)
 
+        stage = str(runtime_state.get("active_stage") or "")
+        agent = str(runtime_state.get("selected_agent") or "")
+        workflow_mode = str(runtime_state.get("workflow_mode") or "")
+        enforce_stage_policy = workflow_mode in {"plan_build_verify", "plan_build_verify_review"} and bool(stage)
+
+        blocked_external_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        allowed_external_calls: list[dict[str, Any]] = []
+        for call in external_calls:
+            name = tool_call_name(call)
+            args = tool_call_arguments(call)
+            command_info = detect_command_trace(name, args)
+            if enforce_stage_policy:
+                policy_result = summarize_stage_tool_policy(
+                    apply_stage_tool_policy(
+                        workflow_mode=workflow_mode,
+                        stage=stage,
+                        agent=agent,
+                        tool_name=name,
+                        command_info=command_info,
+                    )
+                )
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_stage_tool_policy_checked",
+                    title="Stage tool policy checked",
+                    preview=build_stage_tool_policy_preview(policy_result),
+                    payload=policy_result,
+                )
+                if policy_result.get("decision") == "blocked":
+                    blocked_external_calls.append((call, policy_result))
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type="opencode_stage_tool_policy_blocked",
+                        title="Stage tool policy blocked",
+                        preview=build_stage_tool_policy_preview(policy_result),
+                        payload=policy_result,
+                        status="warning",
+                    )
+                    continue
+                if policy_result.get("decision") == "warning":
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type="opencode_stage_tool_policy_warning",
+                        title="Stage tool policy warning",
+                        preview=build_stage_tool_policy_preview(policy_result),
+                        payload=policy_result,
+                        status="warning",
+                    )
+            allowed_external_calls.append(call)
+
+        external_calls = allowed_external_calls
+
         # OpenCode native tools, such as read/edit/bash, must be returned to
         # OpenCode as assistant.tool_calls. Do not execute them inside this API.
         if external_calls and not executable_calls:
@@ -3516,7 +5717,23 @@ async def run_chat_with_mcp_loop(
                 raw_output=raw_output,
             )
 
-        messages.append(assistant_tool_call_message(tool_calls))
+        if blocked_external_calls:
+            messages.append(assistant_tool_call_message([call for call, _ in blocked_external_calls]))
+            for call, policy_result in blocked_external_calls:
+                blocked_payload = {
+                    "error": "stage_tool_policy_blocked",
+                    "tool": policy_result.get("tool"),
+                    "stage": policy_result.get("stage"),
+                    "reason": policy_result.get("reason"),
+                    "decision": "blocked",
+                }
+                messages.append(tool_result_message(call, json.dumps(blocked_payload, ensure_ascii=False)))
+            if not external_calls and not executable_calls:
+                continue
+
+        remaining_tool_calls = list(executable_calls) + list(external_calls)
+        if remaining_tool_calls:
+            messages.append(assistant_tool_call_message(remaining_tool_calls))
 
         for call in executable_calls:
             name = tool_call_name(call)
@@ -3524,6 +5741,60 @@ async def run_chat_with_mcp_loop(
             tool_started_at = time.perf_counter()
             command_info = detect_command_trace(name, args)
             command_started_at = datetime.now().isoformat()
+
+            if enforce_stage_policy:
+                policy_result = summarize_stage_tool_policy(
+                    apply_stage_tool_policy(
+                        workflow_mode=workflow_mode,
+                        stage=stage,
+                        agent=agent,
+                        tool_name=name,
+                        command_info=command_info,
+                    )
+                )
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_stage_tool_policy_checked",
+                    title="Stage tool policy checked",
+                    preview=build_stage_tool_policy_preview(policy_result),
+                    payload=policy_result,
+                )
+                if policy_result.get("decision") == "blocked":
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type="opencode_stage_tool_policy_blocked",
+                        title="Stage tool policy blocked",
+                        preview=build_stage_tool_policy_preview(policy_result),
+                        payload=policy_result,
+                        status="warning",
+                    )
+                    runtime_state.setdefault("tool_events", []).append(
+                        {
+                            "tool_name": name,
+                            "success": False,
+                            "blocked": True,
+                            "stage": stage,
+                            "duration_ms": 0,
+                        }
+                    )
+                    blocked_payload = {
+                        "error": "stage_tool_policy_blocked",
+                        "tool": policy_result.get("tool"),
+                        "stage": policy_result.get("stage"),
+                        "reason": policy_result.get("reason"),
+                        "decision": "blocked",
+                    }
+                    messages.append(tool_result_message(call, json.dumps(blocked_payload, ensure_ascii=False)))
+                    continue
+                if policy_result.get("decision") == "warning":
+                    safe_append_event(
+                        source="opencode-runtime",
+                        event_type="opencode_stage_tool_policy_warning",
+                        title="Stage tool policy warning",
+                        preview=build_stage_tool_policy_preview(policy_result),
+                        payload=policy_result,
+                        status="warning",
+                    )
 
             safe_append_event(
                 source="mcp-runtime",
@@ -3576,6 +5847,15 @@ async def run_chat_with_mcp_loop(
                     duration_ms=tool_duration_ms,
                 )
 
+                runtime_state.setdefault("tool_events", []).append(
+                    {
+                        "tool_name": name,
+                        "success": True,
+                        "stage": runtime_state.get("active_stage", ""),
+                        "duration_ms": tool_duration_ms,
+                    }
+                )
+
                 if command_info:
                     command_finished_payload = build_command_trace_payload(
                         command_info,
@@ -3619,6 +5899,15 @@ async def run_chat_with_mcp_loop(
                     },
                     status="error",
                     duration_ms=tool_duration_ms,
+                )
+
+                runtime_state.setdefault("tool_events", []).append(
+                    {
+                        "tool_name": name,
+                        "success": False,
+                        "stage": runtime_state.get("active_stage", ""),
+                        "duration_ms": tool_duration_ms,
+                    }
                 )
 
                 if command_info:
@@ -4270,9 +6559,11 @@ async def chat_completions(
     request_summary = summarize_chat_request(body)
     opencode_summary = summarize_opencode_request(body)
     context_files = opencode_summary.get("context_files") or []
-    use_plan_build_verify = detect_plan_build_verify_trigger(body.get("messages", []) if isinstance(body, dict) else [])
+    workflow_mode = detect_workflow_mode(body.get("messages", []) if isinstance(body, dict) else [])
+    use_plan_build_verify = workflow_mode in {"plan_build_verify", "plan_build_verify_review"}
     runtime_state: dict[str, Any] = {
         "commands": [],
+        "tool_events": [],
         "loaded_skills": [],
         "selected_agent": "",
         "workflow_mode": "",
@@ -4282,11 +6573,24 @@ async def chat_completions(
         "failed_stages": [],
         "skipped_stages": [],
         "workflow_status": "unknown",
+        "stage_statuses": {},
         "tool_calls_count": 0,
         "mcp_internal_tool_calls": 0,
         "mcp_external_tool_calls": 0,
         "runner_error": None,
         "model_response_sent": False,
+        "warnings": [],
+        "verifier_guard_result": "not_applicable",
+        "validation_strategy": "",
+        "suggested_validation_commands": [],
+        "requested_skills": [],
+        "approved_requested_skills": [],
+        "denied_requested_skills": [],
+        "review_result": {},
+        "stage_outputs": {},
+        "stage_agents": {},
+        "stage_tool_names": {},
+        "started_at": datetime.now().isoformat(),
     }
 
     safe_append_event(
@@ -4362,7 +6666,7 @@ async def chat_completions(
 
         async with runner_lock:
             if use_plan_build_verify:
-                result = await run_plan_build_verify_workflow(req, runtime_state, git_diff_baseline)
+                result = await run_plan_build_verify_workflow(req, runtime_state, git_diff_baseline, workflow_mode=workflow_mode)
             else:
                 result = await run_chat_with_mcp_loop(req, runtime_state=runtime_state)
 
@@ -4403,6 +6707,57 @@ async def chat_completions(
             payload=summarize_diff_generated_snapshot(git_diff_delta),
             duration_ms=duration_ms,
         )
+        runtime_state["changed_files"] = list(git_diff_delta.get("changed_files") or [])
+        runtime_state["diff_preview"] = str(git_diff_delta.get("diff_preview") or "")
+
+        if not runtime_state.get("validation_strategy"):
+            validation_strategy_payload = summarize_validation_strategy(
+                suggest_validation_strategy(
+                    list(runtime_state.get("changed_files") or []) + list(git_diff_delta.get("untracked_files") or []),
+                    BASE_DIR,
+                )
+            )
+            runtime_state["validation_strategy"] = validation_strategy_payload.get("strategy", "")
+            runtime_state["suggested_validation_commands"] = [
+                item.get("command", "")
+                for item in validation_strategy_payload.get("commands") or []
+                if item.get("command")
+            ]
+            safe_append_event(
+                source="opencode-runtime",
+                event_type="opencode_validation_strategy_selected",
+                title="Validation strategy selected",
+                preview=build_validation_strategy_preview(validation_strategy_payload),
+                payload=validation_strategy_payload,
+                duration_ms=duration_ms,
+            )
+            for command in validation_strategy_payload.get("commands") or []:
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_validation_command_suggested",
+                    title="Validation command suggested",
+                    preview=f"command={str(command.get('command') or '')[:120]}",
+                    payload={
+                        "command": command.get("command", ""),
+                        "reason": command.get("reason", ""),
+                        "auto_run": False,
+                    },
+                    duration_ms=duration_ms,
+                )
+            for skipped in validation_strategy_payload.get("skipped_commands") or []:
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_validation_command_skipped",
+                    title="Validation command skipped",
+                    preview=f"reason={str(skipped.get('reason') or '')[:120]}",
+                    payload={
+                        "command": skipped.get("command", ""),
+                        "reason": skipped.get("reason", ""),
+                        "auto_run": False,
+                        "strategy": validation_strategy_payload.get("strategy", ""),
+                    },
+                    duration_ms=duration_ms,
+                )
 
         if isinstance(result, dict) and "error" in result:
             runtime_state["runner_error"] = result.get("error")
@@ -4412,6 +6767,7 @@ async def chat_completions(
         validation_summary_payload = summarize_validation_summary(
             build_validation_summary_payload(runtime_state)
         )
+        runtime_state["validation_result"] = validation_summary_payload.get("validation_result", "unknown")
         safe_append_event(
             source="opencode-runtime",
             event_type="opencode_validation_summary",
@@ -4440,6 +6796,50 @@ async def chat_completions(
             payload=run_summary_payload,
             duration_ms=duration_ms,
         )
+        runtime_state["final_status"] = run_summary_payload.get("final_status", "unknown")
+        runtime_state["workflow_status"] = run_summary_payload.get("workflow_status", runtime_state.get("workflow_status", "unknown"))
+        runtime_state["finished_at"] = datetime.now().isoformat()
+
+        if use_plan_build_verify:
+            try:
+                artifact_info = summarize_audit_artifact(
+                    write_ados_run_artifacts(
+                        run_id,
+                        runtime_state,
+                        runtime_state.get("stage_outputs") or {},
+                        BASE_DIR,
+                    )
+                )
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_ados_run_manifest_written",
+                    title="ADOS run manifest written",
+                    preview=build_audit_artifact_preview(artifact_info),
+                    payload=artifact_info,
+                    duration_ms=duration_ms,
+                )
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_ados_audit_artifact_written",
+                    title="ADOS audit artifacts written",
+                    preview=build_audit_artifact_preview(artifact_info),
+                    payload=artifact_info,
+                    duration_ms=duration_ms,
+                )
+            except Exception as artifact_error:
+                safe_append_event(
+                    source="opencode-runtime",
+                    event_type="opencode_ados_audit_artifact_error",
+                    title="ADOS audit artifact error",
+                    preview=str(artifact_error)[:200],
+                    payload={
+                        "run_id": run_id,
+                        "error": str(artifact_error),
+                        "error_type": type(artifact_error).__name__,
+                    },
+                    status="warning",
+                    duration_ms=duration_ms,
+                )
 
         if use_plan_build_verify:
             if run_summary_payload.get("workflow_status"):
